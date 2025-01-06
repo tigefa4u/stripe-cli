@@ -1,13 +1,18 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/99designs/keyring"
 	"github.com/spf13/viper"
 
+	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/validators"
 )
 
@@ -25,14 +30,61 @@ type Profile struct {
 	AccountID              string
 }
 
+// config key names
+const (
+	AccountIDName              = "account_id"
+	DeviceNameName             = "device_name"
+	DisplayNameName            = "display_name"
+	IsTermsAcceptanceValidName = "is_terms_acceptance_valid"
+	TestModeAPIKeyName         = "test_mode_api_key"
+	TestModePubKeyName         = "test_mode_pub_key"
+	TestModeKeyExpiresAtName   = "test_mode_key_expires_at"
+	LiveModeAPIKeyName         = "live_mode_api_key"
+	LiveModePubKeyName         = "live_mode_pub_key"
+	LiveModeKeyExpiresAtName   = "live_mode_key_expires_at"
+)
+
+const (
+	// DateStringFormat is the format for expiredAt date
+	DateStringFormat = "2006-01-02"
+
+	// KeyValidInDays is the number of days the API key is valid for
+	KeyValidInDays = 90
+
+	// KeyManagementService is the key management service name
+	KeyManagementService = "StripeCLI"
+)
+
+// KeyRing ...
+var KeyRing keyring.Keyring
+
 // CreateProfile creates a profile when logging in
 func (p *Profile) CreateProfile() error {
-	writeErr := p.writeProfile(viper.GetViper())
+	// Remove all keys under existing profile first
+	v := p.deleteProfile(viper.GetViper())
+
+	// Fail open to avoid blocking login
+	p.deleteLivemodeValue(LiveModeAPIKeyName)
+
+	writeErr := p.writeProfile(v)
 	if writeErr != nil {
 		return writeErr
 	}
 
 	return nil
+}
+
+func (p *Profile) deleteProfile(v *viper.Viper) *viper.Viper {
+	for _, key := range v.AllKeys() {
+		if strings.HasPrefix(key, p.ProfileName+".") {
+			newViper, err := removeKey(v, key)
+			if err == nil {
+				// failure to remove a key should not break the login flow
+				v = newViper
+			}
+		}
+	}
+	return v
 }
 
 // GetColor gets the color setting for the user based on the flag or the
@@ -67,7 +119,7 @@ func (p *Profile) GetDeviceName() (string, error) {
 	}
 
 	if err := viper.ReadInConfig(); err == nil {
-		return viper.GetString(p.GetConfigField("device_name")), nil
+		return viper.GetString(p.GetConfigField(DeviceNameName)), nil
 	}
 
 	return "", validators.ErrDeviceNameNotConfigured
@@ -80,7 +132,7 @@ func (p *Profile) GetAccountID() (string, error) {
 	}
 
 	if err := viper.ReadInConfig(); err == nil {
-		return viper.GetString(p.GetConfigField("account_id")), nil
+		return viper.GetString(p.GetConfigField(AccountIDName)), nil
 	}
 
 	return "", validators.ErrAccountIDNotConfigured
@@ -107,48 +159,99 @@ func (p *Profile) GetAPIKey(livemode bool) (string, error) {
 		return p.APIKey, nil
 	}
 
-	// If the user doesn't have an api_key field set, they might be using an
-	// old configuration so try to read from secret_key
-	if !livemode {
-		if !viper.IsSet(p.GetConfigField("api_key")) {
-			p.RegisterAlias("api_key", "secret_key")
-		} else {
-			p.RegisterAlias("test_mode_api_key", "api_key")
-		}
-	}
+	var key string
+	var err error
 
 	// Try to fetch the API key from the configuration file
-	if err := viper.ReadInConfig(); err == nil {
-		key := viper.GetString(p.GetConfigField(livemodeKeyField(livemode)))
+	if !livemode {
+		// If the user doesn't have an api_key field set, they might be using an
+		// old configuration so try to read from secret_key
+		if viper.IsSet(p.GetConfigField("secret_key")) {
+			p.RegisterAlias(TestModeAPIKeyName, "secret_key")
+		} else if viper.IsSet(p.GetConfigField("api_key")) {
+			p.RegisterAlias(TestModeAPIKeyName, "api_key")
+		}
 
-		err := validators.APIKey(key)
+		if err := viper.ReadInConfig(); err == nil {
+			key = viper.GetString(p.GetConfigField(TestModeAPIKeyName))
+		}
+	} else {
+		p.redactAllLivemodeValues()
+		key, err = p.retrieveLivemodeValue(LiveModeAPIKeyName)
 		if err != nil {
 			return "", err
 		}
+	}
 
+	if key != "" {
+		err = validators.APIKey(key)
+		if err != nil {
+			return "", err
+		}
 		return key, nil
 	}
 
 	return "", validators.ErrAPIKeyNotConfigured
 }
 
-// GetPublishableKey returns the publishable key for the user
-func (p *Profile) GetPublishableKey() string {
-	if err := viper.ReadInConfig(); err == nil {
-		if viper.IsSet(p.GetConfigField("publishable_key")) {
-			p.RegisterAlias("test_mode_publishable_key", "publishable_key")
-		}
+// GetExpiresAt returns the API key expirary date
+func (p *Profile) GetExpiresAt(livemode bool) (time.Time, error) {
+	var timeString string
 
-		return viper.GetString(p.GetConfigField("test_mode_publishable_key"))
+	if livemode {
+		timeString = viper.GetString(p.GetConfigField(LiveModeKeyExpiresAtName))
+	} else {
+		timeString = viper.GetString(p.GetConfigField(TestModeKeyExpiresAtName))
 	}
 
-	return ""
+	if timeString != "" {
+		expiresAt, err := time.Parse(DateStringFormat, timeString)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return expiresAt, nil
+	}
+
+	return time.Time{}, validators.ErrAPIKeyNotConfigured
+}
+
+// GetPublishableKey returns the publishable key for the user
+func (p *Profile) GetPublishableKey(livemode bool) (string, error) {
+	var fieldID string
+	var key string
+
+	if livemode {
+		fieldID = LiveModePubKeyName
+	} else {
+		fieldID = TestModePubKeyName
+
+		if viper.IsSet(p.GetConfigField("publishable_key")) {
+			p.RegisterAlias(TestModePubKeyName, "publishable_key")
+		}
+		// there is a bug with viper.GetStringMapString when the key name is too long, which makes
+		// `config --list --project-name <project_name>` unable to read the project specific config
+		if viper.IsSet(p.GetConfigField("test_mode_publishable_key")) {
+			p.RegisterAlias(TestModePubKeyName, "test_mode_publishable_key")
+		}
+	}
+
+	err := viper.ReadInConfig()
+	if err != nil {
+		return "", err
+	}
+
+	key = viper.GetString(p.GetConfigField(fieldID))
+	if key != "" {
+		return key, nil
+	}
+
+	return "", validators.ErrAPIKeyNotConfigured
 }
 
 // GetDisplayName returns the account display name of the user
 func (p *Profile) GetDisplayName() string {
 	if err := viper.ReadInConfig(); err == nil {
-		return viper.GetString(p.GetConfigField("display_name"))
+		return viper.GetString(p.GetConfigField(DisplayNameName))
 	}
 
 	return ""
@@ -161,16 +264,6 @@ func (p *Profile) GetTerminalPOSDeviceID() string {
 	}
 
 	return ""
-}
-
-// GetInstalledPlugins returns a list of locally installed plugins.
-// This does not vary by profile
-func (p *Profile) GetInstalledPlugins() []string {
-	if err := viper.ReadInConfig(); err == nil {
-		return viper.GetStringSlice("installed_plugins")
-	}
-
-	return []string{}
 }
 
 // GetConfigField returns the configuration field for the specific profile
@@ -186,6 +279,7 @@ func (p *Profile) RegisterAlias(alias, key string) {
 // WriteConfigField updates a configuration field and writes the updated
 // configuration to disk.
 func (p *Profile) WriteConfigField(field, value string) error {
+	viper.ReadInConfig()
 	viper.Set(p.GetConfigField(field), value)
 	return viper.WriteConfig()
 }
@@ -195,6 +289,11 @@ func (p *Profile) DeleteConfigField(field string) error {
 	v, err := removeKey(viper.GetViper(), p.GetConfigField(field))
 	if err != nil {
 		return err
+	}
+
+	// delete livemode redacted values from config and full values from keyring
+	if field == LiveModeAPIKeyName {
+		p.deleteLivemodeValue(field)
 	}
 
 	return p.writeProfile(v)
@@ -209,31 +308,39 @@ func (p *Profile) writeProfile(runtimeViper *viper.Viper) error {
 	}
 
 	if p.DeviceName != "" {
-		runtimeViper.Set(p.GetConfigField("device_name"), strings.TrimSpace(p.DeviceName))
+		runtimeViper.Set(p.GetConfigField(DeviceNameName), strings.TrimSpace(p.DeviceName))
 	}
 
 	if p.LiveModeAPIKey != "" {
-		runtimeViper.Set(p.GetConfigField("live_mode_api_key"), strings.TrimSpace(p.LiveModeAPIKey))
+		expiresAt := getKeyExpiresAt()
+		runtimeViper.Set(p.GetConfigField(LiveModeKeyExpiresAtName), expiresAt)
+
+		// // store redacted key in config
+		runtimeViper.Set(p.GetConfigField(LiveModeAPIKeyName), RedactAPIKey(strings.TrimSpace(p.LiveModeAPIKey)))
+
+		// // store actual key in secure keyring
+		p.saveLivemodeValue(LiveModeAPIKeyName, strings.TrimSpace(p.LiveModeAPIKey), "Live mode API key")
 	}
 
 	if p.LiveModePublishableKey != "" {
-		runtimeViper.Set(p.GetConfigField("live_mode_publishable_key"), strings.TrimSpace(p.LiveModePublishableKey))
+		runtimeViper.Set(p.GetConfigField(LiveModePubKeyName), strings.TrimSpace(p.LiveModePublishableKey))
 	}
 
 	if p.TestModeAPIKey != "" {
-		runtimeViper.Set(p.GetConfigField("test_mode_api_key"), strings.TrimSpace(p.TestModeAPIKey))
+		runtimeViper.Set(p.GetConfigField(TestModeAPIKeyName), strings.TrimSpace(p.TestModeAPIKey))
+		runtimeViper.Set(p.GetConfigField(TestModeKeyExpiresAtName), getKeyExpiresAt())
 	}
 
 	if p.TestModePublishableKey != "" {
-		runtimeViper.Set(p.GetConfigField("test_mode_publishable_key"), strings.TrimSpace(p.TestModePublishableKey))
+		runtimeViper.Set(p.GetConfigField(TestModePubKeyName), strings.TrimSpace(p.TestModePublishableKey))
 	}
 
 	if p.DisplayName != "" {
-		runtimeViper.Set(p.GetConfigField("display_name"), strings.TrimSpace(p.DisplayName))
+		runtimeViper.Set(p.GetConfigField(DisplayNameName), strings.TrimSpace(p.DisplayName))
 	}
 
 	if p.AccountID != "" {
-		runtimeViper.Set(p.GetConfigField("account_id"), strings.TrimSpace(p.AccountID))
+		runtimeViper.Set(p.GetConfigField(AccountIDName), strings.TrimSpace(p.AccountID))
 	}
 
 	runtimeViper.MergeInConfig()
@@ -274,10 +381,184 @@ func (p *Profile) safeRemove(v *viper.Viper, key string) *viper.Viper {
 	return v
 }
 
-func livemodeKeyField(livemode bool) string {
-	if livemode {
-		return "live_mode_api_key"
+// redactAllLivemodeValues redacts all livemode values in the local config file
+func (p *Profile) redactAllLivemodeValues() {
+	color := ansi.Color(os.Stdout)
+
+	if err := viper.ReadInConfig(); err == nil {
+		// if the config file has expires at date, then it is using the new livemode key storage
+		if viper.IsSet(p.GetConfigField(LiveModeAPIKeyName)) {
+			key := viper.GetString(p.GetConfigField(LiveModeAPIKeyName))
+			if key == "" || len(key) < 12 {
+				p.DeleteConfigField(LiveModeAPIKeyName)
+				return
+			}
+
+			if !isRedactedAPIKey(key) {
+				fmt.Println(color.Yellow(`
+(!) Livemode value found for the field '` + LiveModeAPIKeyName + `' in your config file.
+Livemode values from the config file will be redacted and will not be used.`))
+
+				p.WriteConfigField(LiveModeAPIKeyName, RedactAPIKey(key))
+			}
+		}
+	}
+}
+
+// RedactAPIKey returns a redacted version of API keys. The first 8 and last 4
+// characters are not redacted, everything else is replaced by "*" characters.
+//
+// It panics if the provided string has less than 12 characters.
+func RedactAPIKey(apiKey string) string {
+	var b strings.Builder
+
+	b.WriteString(apiKey[0:8])                         // #nosec G104 (gosec bug: https://github.com/securego/gosec/issues/267)
+	b.WriteString(strings.Repeat("*", len(apiKey)-12)) // #nosec G104 (gosec bug: https://github.com/securego/gosec/issues/267)
+	b.WriteString(apiKey[len(apiKey)-4:])              // #nosec G104 (gosec bug: https://github.com/securego/gosec/issues/267)
+
+	return b.String()
+}
+
+// isRedactedAPIKey checks if the input string is a refacted api key
+func isRedactedAPIKey(apiKey string) bool {
+	keyParts := strings.Split(apiKey, "_")
+	if len(keyParts) < 3 {
+		return false
 	}
 
-	return "test_mode_api_key"
+	if keyParts[0] != "sk" && keyParts[0] != "rk" {
+		return false
+	}
+
+	if RedactAPIKey(apiKey) != apiKey {
+		return false
+	}
+
+	return true
+}
+
+func getKeyExpiresAt() string {
+	return time.Now().AddDate(0, 0, KeyValidInDays).UTC().Format(DateStringFormat)
+}
+
+// saveLivemodeValue saves livemode value of given key in keyring
+func (p *Profile) saveLivemodeValue(field, value, description string) {
+	fieldID := p.GetConfigField(field)
+	_ = KeyRing.Set(keyring.Item{
+		Key:         fieldID,
+		Data:        []byte(value),
+		Description: description,
+		Label:       fieldID,
+	})
+}
+
+// retrieveLivemodeValue retrieves livemode value of given key in keyring
+func (p *Profile) retrieveLivemodeValue(key string) (string, error) {
+	fieldID := p.GetConfigField(key)
+	existingKeys, err := KeyRing.Keys()
+	if err != nil {
+		return "", err
+	}
+
+	for _, item := range existingKeys {
+		if item == fieldID {
+			value, _ := KeyRing.Get(fieldID)
+			return string(value.Data), nil
+		}
+	}
+
+	return "", validators.ErrAPIKeyNotConfigured
+}
+
+// deleteLivemodeValue deletes livemode value of given key in keyring
+func (p *Profile) deleteLivemodeValue(key string) error {
+	fieldID := p.GetConfigField(key)
+	existingKeys, err := KeyRing.Keys()
+	if err != nil {
+		return err
+	}
+	for _, item := range existingKeys {
+		if item == fieldID {
+			KeyRing.Remove(fieldID)
+			return nil
+		}
+	}
+	return nil
+}
+
+// ExperimentalFields are currently only used for request signing
+type ExperimentalFields struct {
+	ContextualName string
+	PrivateKey     string
+	StripeHeaders  string
+}
+
+const (
+	experimentalPrefix         = "experimental"
+	experimentalStripeHeaders  = experimentalPrefix + "." + "stripe_headers"
+	experimentalContextualName = experimentalPrefix + "." + "contextual_name"
+	experimentalPrivateKey     = experimentalPrefix + "." + "private_key"
+)
+
+// GetExperimentalFields returns a struct of the profile's experimental fields. These fields are only ever additive in functionality.
+// If the API key is being overridden, via the --api-key flag or STRIPE_API_KEY env variable, this returns an empty struct.
+func (p *Profile) GetExperimentalFields() ExperimentalFields {
+	if err := viper.ReadInConfig(); err == nil && os.Getenv("STRIPE_API_KEY") == "" && p.APIKey == "" {
+		name := viper.GetString(p.GetConfigField(experimentalContextualName))
+		privKey := viper.GetString(p.GetConfigField(experimentalPrivateKey))
+		headers := viper.GetString(p.GetConfigField(experimentalStripeHeaders))
+
+		return ExperimentalFields{
+			ContextualName: name,
+			PrivateKey:     privKey,
+			StripeHeaders:  headers,
+		}
+	}
+	return ExperimentalFields{
+		ContextualName: "",
+		PrivateKey:     "",
+		StripeHeaders:  "",
+	}
+}
+
+// SessionCredentials are the credentials needed for this session
+type SessionCredentials struct {
+	UAT        string `json:"uat"`
+	PrivateKey string `json:"private_key"`
+	AccountID  string `json:"account_id"`
+}
+
+// GetSessionCredentials retrieves the session credentials from the keyring
+func (p *Profile) GetSessionCredentials() (*SessionCredentials, error) {
+	key := p.GetConfigField("stripe_cli_session")
+	ring, err := keyring.Open(keyring.Config{
+		KeychainTrustApplication: true,
+		ServiceName:              KeyManagementService,
+	})
+	if err != nil {
+		return nil, err
+	}
+	keyringItem, err := ring.Get(key)
+	if err != nil {
+		if err == keyring.ErrKeyNotFound {
+			return nil, errors.New("no session")
+		}
+		return nil, err
+	}
+
+	creds := SessionCredentials{}
+	if err := json.Unmarshal(keyringItem.Data, &creds); err != nil {
+		return nil, err
+	}
+
+	currentAccountID, err := p.GetAccountID()
+	if err != nil {
+		return nil, err
+	}
+
+	if creds.AccountID == "" || creds.AccountID != currentAccountID {
+		return nil, errors.New("found a session, but it doesn't match your current account")
+	}
+
+	return &creds, nil
 }

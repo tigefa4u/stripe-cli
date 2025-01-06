@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -24,6 +25,8 @@ type InstallCmd struct {
 	cfg *config.Config
 	Cmd *cobra.Command
 	fs  afero.Fs
+
+	apiBaseURL string
 }
 
 // NewInstallCmd creates a command for installing plugins
@@ -40,6 +43,10 @@ func NewInstallCmd(config *config.Config) *InstallCmd {
 			By default, the most recent version will be installed.`,
 		RunE: ic.runInstallCmd,
 	}
+
+	// Hidden configuration flags, useful for dev/debugging
+	ic.Cmd.Flags().StringVar(&ic.apiBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
+	ic.Cmd.Flags().MarkHidden("api-base") // #nosec G104
 
 	return ic
 }
@@ -58,15 +65,9 @@ func parseInstallArg(arg string) (string, string) {
 	return plugin, version
 }
 
-func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
-	// Refresh the plugin before proceeding
-	err := plugins.RefreshPluginManifest(cmd.Context(), ic.cfg, ic.fs, stripe.DefaultAPIBaseURL)
+func (ic *InstallCmd) installPluginByName(cmd *cobra.Command, arg string) error {
+	pluginName, version := parseInstallArg(arg)
 
-	if err != nil {
-		return err
-	}
-
-	pluginName, version := parseInstallArg(args[0])
 	plugin, err := plugins.LookUpPlugin(cmd.Context(), ic.cfg, ic.fs, pluginName)
 
 	if err != nil {
@@ -83,14 +84,49 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 		}).Debug("Ctrl+C received, cleaning up...")
 	})
 
-	err = plugin.Install(ctx, ic.cfg, ic.fs, version, stripe.DefaultAPIBaseURL)
+	err = plugin.Install(ctx, ic.cfg, ic.fs, version, ic.apiBaseURL)
+
+	return err
+}
+
+func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateAPIBaseURL(ic.apiBaseURL); err != nil {
+		return err
+	}
+
+	var err error
+	color := ansi.Color(os.Stdout)
+
+	// check if plugin manfest exists to be updated with the plugin to be installed
+	configPath := ic.cfg.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME"))
+	pluginManifestPath := filepath.Join(configPath, "plugins.toml")
+	_, err = afero.ReadFile(ic.fs, pluginManifestPath)
+	if os.IsNotExist(err) {
+		// plugin manifest does not exist. will need to retrieve from web
+		// api key is required to retrieve the plugin manifest
+		_, err = ic.cfg.GetProfile().GetAPIKey(false)
+		if err != nil {
+			fmt.Println(color.Red("x could not install plugin. please run `stripe login` and try again"))
+			return fmt.Errorf("installation process exited")
+		}
+	}
+
+	// Refresh the plugin before proceeding
+	err = plugins.RefreshPluginManifest(cmd.Context(), ic.cfg, ic.fs, ic.apiBaseURL)
+	if err != nil {
+		return err
+	}
+
+	err = ic.installPluginByName(cmd, args[0])
+	if err != nil {
+		return err
+	}
 
 	if err == nil {
-		color := ansi.Color(os.Stdout)
 		fmt.Println(color.Green("✔ installation complete."))
 	}
 
-	return err
+	return nil
 }
 
 func withSIGTERMCancel(ctx context.Context, onCancel func()) context.Context {

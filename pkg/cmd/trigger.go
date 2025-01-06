@@ -18,12 +18,14 @@ type triggerCmd struct {
 
 	fs            afero.Fs
 	stripeAccount string
+	apiVersion    string
 	skip          []string
 	override      []string
 	add           []string
 	remove        []string
 	raw           string
 	apiBaseURL    string
+	edit          bool
 }
 
 func newTriggerCmd() *triggerCmd {
@@ -54,6 +56,8 @@ needed to create the triggered event as well as the corresponding API objects.
 	tc.cmd.Flags().StringArrayVar(&tc.add, "add", []string{}, "Add params to the trigger")
 	tc.cmd.Flags().StringArrayVar(&tc.remove, "remove", []string{}, "Remove params from the trigger")
 	tc.cmd.Flags().StringVar(&tc.raw, "raw", "", "Raw fixture in string format to replace all default fixtures")
+	tc.cmd.Flags().StringVar(&tc.apiVersion, "api-version", "", "Specify API version for trigger")
+	tc.cmd.Flags().BoolVar(&tc.edit, "edit", false, "Edit the trigger directly in your default IDE")
 
 	// Hidden configuration flags, useful for dev/debugging
 	tc.cmd.Flags().StringVar(&tc.apiBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
@@ -64,6 +68,10 @@ needed to create the triggered event as well as the corresponding API objects.
 
 func (tc *triggerCmd) runTriggerCmd(cmd *cobra.Command, args []string) error {
 	version.CheckLatestVersion()
+
+	if err := stripe.ValidateAPIBaseURL(tc.apiBaseURL); err != nil {
+		return err
+	}
 
 	if len(args) == 0 {
 		cmd.Help()
@@ -78,7 +86,7 @@ func (tc *triggerCmd) runTriggerCmd(cmd *cobra.Command, args []string) error {
 
 	event := args[0]
 
-	_, err = fixtures.Trigger(cmd.Context(), event, tc.stripeAccount, tc.apiBaseURL, apiKey, tc.skip, tc.override, tc.add, tc.remove, tc.raw)
+	_, err = fixtures.Trigger(cmd.Context(), event, tc.stripeAccount, tc.apiBaseURL, apiKey, tc.skip, tc.override, tc.add, tc.remove, tc.raw, tc.apiVersion, tc.edit)
 	if err != nil {
 		return err
 	}

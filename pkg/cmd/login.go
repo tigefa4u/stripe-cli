@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"os"
-
 	"github.com/spf13/cobra"
 
 	"github.com/stripe/stripe-cli/pkg/login"
@@ -36,9 +34,13 @@ func newLoginCmd() *loginCmd {
 }
 
 func (lc *loginCmd) runLoginCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateDashboardBaseURL(lc.dashboardBaseURL); err != nil {
+		return err
+	}
+
 	if lc.interactive {
 		return login.InteractiveLogin(cmd.Context(), &Config)
 	}
 
-	return login.Login(cmd.Context(), lc.dashboardBaseURL, &Config, os.Stdin)
+	return login.Login(cmd.Context(), lc.dashboardBaseURL, &Config)
 }

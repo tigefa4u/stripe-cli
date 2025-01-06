@@ -3,6 +3,7 @@ package resource
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/config"
 	"github.com/stripe/stripe-cli/pkg/requests"
+	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/validators"
 )
 
@@ -33,11 +35,16 @@ type OperationCmd struct {
 	URLParams []string
 
 	stringFlags map[string]*string
+	arrayFlags  map[string]*[]string
 
 	data []string
 }
 
 func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateAPIBaseURL(oc.APIBaseURL); err != nil {
+		return err
+	}
+
 	apiKey, err := oc.Profile.GetAPIKey(oc.Livemode)
 	if err != nil {
 		return err
@@ -51,7 +58,27 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 		// only include fields explicitly set by the user to avoid conflicts between e.g. account_balance, balance
 		if oc.Cmd.Flags().Changed(stringProp) {
 			paramName := strings.ReplaceAll(stringProp, "-", "_")
-			flagParams = append(flagParams, fmt.Sprintf("%s=%s", paramName, *stringVal))
+			if strings.Contains(paramName, ".") {
+				fullParam := constructParamFromDot(paramName)
+				flagParams = append(flagParams, fmt.Sprintf("%s=%s", fullParam, *stringVal))
+			} else {
+				flagParams = append(flagParams, fmt.Sprintf("%s=%s", paramName, *stringVal))
+			}
+		}
+	}
+
+	for arrayProp, arrayVal := range oc.arrayFlags {
+		// only include fields explicitly set by the user to avoid conflicts between e.g. account_balance, balance
+		if oc.Cmd.Flags().Changed(arrayProp) {
+			paramName := strings.ReplaceAll(arrayProp, "-", "_")
+			for _, arrayItem := range *arrayVal {
+				if strings.Contains(paramName, ".") {
+					fullParam := constructParamFromDot(paramName)
+					flagParams = append(flagParams, fmt.Sprintf("%s[]=%s", fullParam, arrayItem))
+				} else {
+					flagParams = append(flagParams, fmt.Sprintf("%s[]=%s", paramName, arrayItem))
+				}
+			}
 		}
 	}
 
@@ -85,6 +112,10 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 		if displayName != "" {
 			fmt.Printf("> Account Name: %s\n", displayName)
 		}
+		if strings.HasPrefix(path, "/v1/accounts/") {
+			connectedAccountID := strings.Split(path, "/")[3]
+			fmt.Printf("> Connected Account: %s\n", connectedAccountID)
+		}
 
 		// call the confirm command from base request
 		confirmation, err := oc.Confirm()
@@ -96,18 +127,38 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 		}
 
 		// if confirmation is provided, make the request
-		_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false)
+		_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false, nil)
 
 		return err
 	}
 	// else
-	_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false)
+	_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false, nil)
 	return err
 }
 
 //
 // Public functions
 //
+
+// NewUnsupportedV2BillingOperationCmd returns a new cobra command for an unsupported v2 billing command.
+// This is temporary until resource commands support the /v2/billing namespace.
+func NewUnsupportedV2BillingOperationCmd(parentCmd *cobra.Command, name string, path string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:         name,
+		Annotations: make(map[string]string),
+		Run: func(cmd *cobra.Command, args []string) {
+			output := `
+%s is not supported by Stripe CLI yet. Please use the %s or cURL to create a %s, instead.
+
+* Hint: If you're trying to test webhook events, you can always use %s or %s.
+			`
+
+			fmt.Println(fmt.Sprintf(output, ansi.Bold(path), ansi.Linkify("Dashboard", "https://dashboard.stripe.com", os.Stdout), parentCmd.Name(), ansi.Bold("stripe trigger v1.billing.meter.no_meter_found"), ansi.Bold("stripe trigger v1.billing.meter.error_report_triggered")))
+		},
+	}
+	parentCmd.AddCommand(cmd)
+	return cmd
+}
 
 // NewOperationCmd returns a new OperationCmd.
 func NewOperationCmd(parentCmd *cobra.Command, name, path, httpVerb string, propFlags map[string]string, cfg *config.Config) *OperationCmd {
@@ -124,6 +175,7 @@ func NewOperationCmd(parentCmd *cobra.Command, name, path, httpVerb string, prop
 		URLParams: urlParams,
 
 		stringFlags: make(map[string]*string),
+		arrayFlags:  make(map[string]*[]string),
 	}
 	cmd := &cobra.Command{
 		Use:         name,
@@ -132,11 +184,15 @@ func NewOperationCmd(parentCmd *cobra.Command, name, path, httpVerb string, prop
 		Args:        validators.ExactArgs(len(urlParams)),
 	}
 
-	for prop := range propFlags {
+	for prop, propType := range propFlags {
 		// it's ok to treat all flags as string flags because we don't send any default flag values to the API
 		// i.e. "account_balance" default is "" not 0 but this is ok
 		flagName := strings.ReplaceAll(prop, "_", "-")
-		operationCmd.stringFlags[flagName] = cmd.Flags().String(flagName, "", "")
+		if propType == "array" {
+			operationCmd.arrayFlags[flagName] = cmd.Flags().StringArray(flagName, []string{}, "")
+		} else {
+			operationCmd.stringFlags[flagName] = cmd.Flags().String(flagName, "", "")
+		}
 		cmd.Flags().SetAnnotation(flagName, "request", []string{"true"})
 	}
 
@@ -205,6 +261,8 @@ func operationUsageTemplate(urlParams []string) string {
 {{WrappedRequestParamsFlagUsages . | trimTrailingWhitespaces}}
 
 %s
+
+%s
 {{WrappedNonRequestParamsFlagUsages . | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
 
 %s
@@ -221,8 +279,23 @@ Use "{{.CommandPath}} [command] --help" for more information about a command.{{e
 		ansi.Bold("Examples:"),
 		ansi.Bold("Available Operations:"),
 		ansi.Bold("Request Parameters:"),
+		ansi.Italic("Note: all types are specifically for the Stripe CLI itself, not the Stripe API. The CLI handles\ntransforming types to what the API expects."),
 		ansi.Bold("Flags:"),
 		ansi.Bold("Global Flags:"),
 		ansi.Bold("Additional help topics:"),
 	)
+}
+
+func constructParamFromDot(dotParam string) string {
+	paramPath := strings.Split(dotParam, ".")
+	var param string
+	for i, p := range paramPath {
+		if i == 0 {
+			param = p
+		} else {
+			param = fmt.Sprintf("%s[%s]", param, p)
+		}
+	}
+
+	return param
 }

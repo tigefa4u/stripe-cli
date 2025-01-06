@@ -18,10 +18,13 @@ type FixturesCmd struct {
 	Cfg *config.Config
 
 	stripeAccount string
+	apiVersion    string
+	apiBaseURL    string
 	skip          []string
 	override      []string
 	add           []string
 	remove        []string
+	edit          bool
 }
 
 func newFixturesCmd(cfg *config.Config) *FixturesCmd {
@@ -42,12 +45,22 @@ func newFixturesCmd(cfg *config.Config) *FixturesCmd {
 	fixturesCmd.Cmd.Flags().StringArrayVar(&fixturesCmd.override, "override", []string{}, "Override parameters in the fixture")
 	fixturesCmd.Cmd.Flags().StringArrayVar(&fixturesCmd.add, "add", []string{}, "Add parameters in the fixture")
 	fixturesCmd.Cmd.Flags().StringArrayVar(&fixturesCmd.remove, "remove", []string{}, "Remove parameters from the fixture")
+	fixturesCmd.Cmd.Flags().StringVar(&fixturesCmd.apiVersion, "api-version", "", "Specify API version in the fixture")
+	fixturesCmd.Cmd.Flags().BoolVar(&fixturesCmd.edit, "edit", false, "Edit the fixture directly in your default IDE")
+
+	// Hidden configuration flags, useful for dev/debugging
+	fixturesCmd.Cmd.Flags().StringVar(&fixturesCmd.apiBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
+	fixturesCmd.Cmd.Flags().MarkHidden("api-base") // #nosec G104
 
 	return fixturesCmd
 }
 
 func (fc *FixturesCmd) runFixturesCmd(cmd *cobra.Command, args []string) error {
 	version.CheckLatestVersion()
+
+	if err := stripe.ValidateAPIBaseURL(fc.apiBaseURL); err != nil {
+		return err
+	}
 
 	apiKey, err := fc.Cfg.Profile.GetAPIKey(false)
 	if err != nil {
@@ -62,18 +75,19 @@ func (fc *FixturesCmd) runFixturesCmd(cmd *cobra.Command, args []string) error {
 		afero.NewOsFs(),
 		apiKey,
 		fc.stripeAccount,
-		stripe.DefaultAPIBaseURL,
+		fc.apiBaseURL,
 		args[0],
 		fc.skip,
 		fc.override,
 		fc.add,
 		fc.remove,
+		fc.edit,
 	)
 	if err != nil {
 		return err
 	}
 
-	_, err = fixture.Execute(cmd.Context())
+	_, err = fixture.Execute(cmd.Context(), fc.apiVersion)
 
 	if err != nil {
 		return err

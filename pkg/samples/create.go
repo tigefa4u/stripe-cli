@@ -7,12 +7,12 @@ import (
 	"os/signal"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/stripe/stripe-cli/pkg/validators"
+
 	"github.com/spf13/afero"
 
-	"github.com/stripe/stripe-cli/pkg/config"
-	gitpkg "github.com/stripe/stripe-cli/pkg/git"
-
-	"gopkg.in/src-d/go-git.v4"
+	"github.com/go-git/go-git/v5"
 )
 
 // CreationStatus is the current step in the sample creation routine
@@ -37,6 +37,9 @@ const (
 	// DidConfigure means the .env of the sample has finished being configured with the user's Stripe account details
 	DidConfigure
 
+	// DidConfigureWithoutTestPubKey means the .env of the sample has finished being configured without the publishable key
+	DidConfigureWithoutTestPubKey
+
 	// Done means sample creation is complete
 	Done
 )
@@ -50,9 +53,8 @@ type CreationResult struct {
 }
 
 // Create creates a sample at a destination with the selected integration, client language, and server language
-func Create(
+func (sampleManager *SampleManager) Create(
 	ctx context.Context,
-	config *config.Config,
 	sampleName string,
 	selectedConfig *SelectedConfig,
 	destination string,
@@ -61,20 +63,27 @@ func Create(
 ) {
 	defer close(resultChan)
 
-	sample := Samples{
-		Config: config,
-		Fs:     afero.NewOsFs(),
-		Git:    gitpkg.Operations{},
-	}
+	cacheFolder, err := sampleManager.appCacheFolder("samples-list")
+	if err != nil {
+		logger := log.Logger{
+			Out: os.Stdout,
+		}
 
-	exists, _ := afero.DirExists(sample.Fs, destination)
+		logger.WithFields(log.Fields{
+			"prefix": "samples.create.cacheFolder",
+			"error":  err,
+		}).Debug("Could not create cacheFolder for samples")
+	}
+	sampleManager.SampleLister = newCachedGithubSampleLister(sampleManager, sampleListGithubURL, cacheFolder)
+
+	exists, _ := afero.DirExists(sampleManager.Fs, destination)
 	if exists {
 		resultChan <- CreationResult{Err: fmt.Errorf("Path already exists for: %s", destination)}
 		return
 	}
 
 	if forceRefresh {
-		err := sample.DeleteCache(sampleName)
+		err := sampleManager.DeleteCache(sampleName)
 		if err != nil {
 			logger := log.Logger{
 				Out: os.Stdout,
@@ -94,7 +103,7 @@ func Create(
 	// depending on whether or not it's. Additionally, this
 	// identifies if the sample has multiple integrations and what
 	// languages it supports.
-	err := sample.Initialize(sampleName)
+	err = sampleManager.Initialize(sampleName)
 	if err != nil {
 		switch e := err.Error(); e {
 		case git.NoErrAlreadyUpToDate.Error():
@@ -114,7 +123,7 @@ func Create(
 
 	resultChan <- CreationResult{State: DidInitialize}
 
-	sample.SelectedConfig = *selectedConfig
+	sampleManager.SelectedConfig = *selectedConfig
 
 	// Setup to intercept ctrl+c
 	c := make(chan os.Signal, 1)
@@ -122,7 +131,7 @@ func Create(
 
 	go func() {
 		<-c
-		sample.Cleanup(sampleName)
+		sampleManager.Cleanup(sampleName)
 		os.Exit(1)
 	}()
 
@@ -131,7 +140,7 @@ func Create(
 	// Create the target folder to copy the sample in to. We do
 	// this here in case any of the steps above fail, minimizing
 	// the change that we create a dangling empty folder
-	targetPath, err := sample.MakeFolder(destination)
+	targetPath, err := sampleManager.MakeFolder(destination)
 	if err != nil {
 		resultChan <- CreationResult{Err: err}
 		return
@@ -139,7 +148,7 @@ func Create(
 
 	// Perform the copy of the sample given the selected options
 	// from the selections above
-	err = sample.Copy(targetPath)
+	err = sampleManager.Copy(targetPath)
 	if err != nil {
 		resultChan <- CreationResult{Err: err}
 		return
@@ -149,13 +158,17 @@ func Create(
 
 	resultChan <- CreationResult{State: WillConfigure}
 
-	err = sample.ConfigureDotEnv(ctx, targetPath)
+	err = sampleManager.WriteDotEnv(ctx, targetPath)
 	if err != nil {
-		resultChan <- CreationResult{Err: err}
-		return
+		if err == validators.ErrPubKeyNotConfigured {
+			resultChan <- CreationResult{State: DidConfigureWithoutTestPubKey}
+		} else {
+			resultChan <- CreationResult{Err: err}
+			return
+		}
+	} else {
+		resultChan <- CreationResult{State: DidConfigure}
 	}
 
-	resultChan <- CreationResult{State: DidConfigure}
-
-	resultChan <- CreationResult{State: Done, Path: targetPath, PostInstall: sample.PostInstall()}
+	resultChan <- CreationResult{State: Done, Path: targetPath, PostInstall: sampleManager.PostInstall()}
 }

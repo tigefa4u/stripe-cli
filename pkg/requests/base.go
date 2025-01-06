@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -110,6 +109,10 @@ var confirmationCommands = map[string]bool{http.MethodDelete: true}
 
 // RunRequestsCmd is the interface exposed for the CLI to run network requests through
 func (rb *Base) RunRequestsCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateAPIBaseURL(rb.APIBaseURL); err != nil {
+		return err
+	}
+
 	if len(args) > 1 {
 		return fmt.Errorf("this command only supports one argument. Run with the --help flag to see usage and examples")
 	}
@@ -136,7 +139,7 @@ func (rb *Base) RunRequestsCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	_, err = rb.MakeRequest(cmd.Context(), apiKey, path, &rb.Parameters, false)
+	_, err = rb.MakeRequest(cmd.Context(), apiKey, path, &rb.Parameters, false, nil)
 
 	return err
 }
@@ -185,24 +188,11 @@ func (rb *Base) MakeMultiPartRequest(ctx context.Context, apiKey, path string, p
 		return []byte{}, err
 	}
 
-	configure := func(req *http.Request) {
+	configure := func(req *http.Request) error {
 		req.Header.Set("Content-Type", contentType)
+		return nil
 	}
 
-	return rb.performRequest(ctx, apiKey, path, params, reqBody.String(), errOnStatus, configure)
-}
-
-// MakeRequest will make a request to the Stripe API with the specific variables given to it
-func (rb *Base) MakeRequest(ctx context.Context, apiKey, path string, params *RequestParameters, errOnStatus bool) ([]byte, error) {
-	data, err := rb.buildDataForRequest(params)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	return rb.performRequest(ctx, apiKey, path, params, data, errOnStatus, nil)
-}
-
-func (rb *Base) performRequest(ctx context.Context, apiKey, path string, params *RequestParameters, data string, errOnStatus bool, additionalConfigure func(req *http.Request)) ([]byte, error) {
 	parsedBaseURL, err := url.Parse(rb.APIBaseURL)
 	if err != nil {
 		return []byte{}, err
@@ -214,13 +204,74 @@ func (rb *Base) performRequest(ctx context.Context, apiKey, path string, params 
 		Verbose: rb.showHeaders,
 	}
 
-	configure := func(req *http.Request) {
+	return rb.performRequest(ctx, client, path, params, reqBody.String(), errOnStatus, configure)
+}
+
+// MakeV2Request will make a application/json request to the Stripe API with the specific payload given to it.
+func (rb *Base) MakeV2Request(ctx context.Context, apiKey, path string, params *RequestParameters, errOnStatus bool, additionalConfigure func(req *http.Request) error, jsonPayload string) ([]byte, error) {
+	parsedBaseURL, err := url.Parse(rb.APIBaseURL)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	client := &stripe.Client{
+		BaseURL: parsedBaseURL,
+		APIKey:  apiKey,
+		Verbose: rb.showHeaders,
+	}
+
+	return rb.performRequest(ctx, client, path, params, jsonPayload, errOnStatus, additionalConfigure)
+}
+
+// MakeRequest will make a request to the Stripe API with the specific variables given to it
+func (rb *Base) MakeRequest(ctx context.Context, apiKey, path string, params *RequestParameters, errOnStatus bool, additionalConfigure func(req *http.Request) error) ([]byte, error) {
+	parsedBaseURL, err := url.Parse(rb.APIBaseURL)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	client := &stripe.Client{
+		BaseURL: parsedBaseURL,
+		APIKey:  apiKey,
+		Verbose: rb.showHeaders,
+	}
+
+	return rb.MakeRequestWithClient(ctx, client, path, params, errOnStatus, additionalConfigure)
+}
+
+// MakeRequestWithClient will make a request to the Stripe API with the specific
+// variables given to it using the provided client.
+func (rb *Base) MakeRequestWithClient(ctx context.Context, client stripe.RequestPerformer, path string, params *RequestParameters, errOnStatus bool, additionalConfigure func(req *http.Request) error) ([]byte, error) {
+	data, err := rb.BuildDataForRequest(params)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	return rb.performRequest(ctx, client, path, params, data, errOnStatus, additionalConfigure)
+}
+
+func (rb *Base) performRequest(ctx context.Context, client stripe.RequestPerformer, path string, params *RequestParameters, data string, errOnStatus bool, additionalConfigure func(req *http.Request) error) ([]byte, error) {
+	configure := func(req *http.Request) error {
 		rb.setIdempotencyHeader(req, params)
 		rb.setStripeAccountHeader(req, params)
 		rb.setVersionHeader(req, params)
 		if additionalConfigure != nil {
-			additionalConfigure(req)
+			if err := additionalConfigure(req); err != nil {
+				return err
+			}
 		}
+
+		if rb.Profile != nil {
+			experimentalFields := rb.Profile.GetExperimentalFields()
+			if experimentalFields.StripeHeaders != "" {
+				err := rb.experimentalRequestSigning(req, experimentalFields)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
 	}
 
 	resp, err := client.PerformRequest(ctx, rb.Method, path, data, configure)
@@ -230,7 +281,7 @@ func (rb *Base) performRequest(ctx context.Context, apiKey, path string, params 
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == 401 || (errOnStatus && resp.StatusCode >= 300) {
 		requestError := compileRequestError(body, resp.StatusCode)
@@ -275,13 +326,14 @@ func (rb *Base) Confirm() (bool, error) {
 	return rb.confirmCommand()
 }
 
+// BuildDataForRequest builds request payload
 // Note: We converted to using two arrays to track keys and values, with our own
 // implementation of Go's url.Values Encode function due to our query parameters being
 // order sensitive for API requests involving arrays like `items` for `/v1/orders`.
 // Go's url.Values uses Go's map, which jumbles the key ordering, and their Encode
 // implementation sorts keys by alphabetical order, but this doesn't work for us since
 // some API endpoints have required parameter ordering. Yes, this is hacky, but it works.
-func (rb *Base) buildDataForRequest(params *RequestParameters) (string, error) {
+func (rb *Base) BuildDataForRequest(params *RequestParameters) (string, error) {
 	keys := []string{}
 	values := []string{}
 
@@ -466,4 +518,36 @@ func normalizePath(path string) string {
 	}
 
 	return "/v1/" + path
+}
+
+func (rb *Base) experimentalRequestSigning(req *http.Request, experimentalFields config.ExperimentalFields) error {
+	privKey := experimentalFields.PrivateKey
+
+	keyToValues := strings.Split(strings.Trim(experimentalFields.StripeHeaders, ";"), ";")
+	for _, pair := range keyToValues {
+		header := strings.Split(pair, "=")
+		if len(header) != 2 {
+			continue
+		}
+		headerName := header[0]
+		headerValue := header[1]
+		if headerName == stripeContextHeaderName {
+			displayMessage := fmt.Sprintf("Operating in %s %s\n", ansi.Bold(experimentalFields.ContextualName), ansi.Color(os.Stdout).Gray(10, "("+headerValue+")..."))
+			fmt.Print(ansi.Color(os.Stdout).Gray(10, displayMessage))
+		} else if headerName == authorizationHeaderName && privKey == "" {
+			creds, err := rb.Profile.GetSessionCredentials()
+			if err != nil {
+				return err
+			}
+			headerValue += creds.UAT
+			privKey = creds.PrivateKey
+		}
+		req.Header.Set(headerName, headerValue)
+	}
+	if len(keyToValues) > 0 {
+		// Must sign the request AFTER all headers have been set
+		SignRequest(req, privKey)
+	}
+
+	return nil
 }

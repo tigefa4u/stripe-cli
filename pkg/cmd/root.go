@@ -13,6 +13,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	"github.com/stripe/stripe-cli/pkg/cmd/resource"
@@ -56,9 +57,18 @@ var rootCmd = &cobra.Command{
 		// if getting the config errors, don't fail running the command
 		merchant, _ := Config.Profile.GetAccountID()
 		telemetryMetadata := stripe.GetEventMetadata(cmd.Context())
-		telemetryMetadata.SetCobraCommandContext(cmd)
-		telemetryMetadata.SetMerchant(merchant)
-		telemetryMetadata.SetUserAgent(useragent.GetEncodedUserAgent())
+		if telemetryMetadata != nil {
+			telemetryMetadata.SetCobraCommandContext(cmd)
+			telemetryMetadata.SetMerchant(merchant)
+			telemetryMetadata.SetUserAgent(useragent.GetEncodedUserAgent())
+
+			flags := []string{}
+			cmd.Flags().Visit(func(flag *pflag.Flag) {
+				flags = append(flags, flag.Name)
+			})
+			flagsStr := strings.Join(flags, ",")
+			telemetryMetadata.SetCommandFlags(flagsStr)
+		}
 
 		// plugins send their own telemetry due to having richer context than the CLI does
 		if !plugins.IsPluginCommand(cmd) {
@@ -100,10 +110,13 @@ func Execute(ctx context.Context) {
 		errString := err.Error()
 
 		isLoginRequiredError := errString == validators.ErrAPIKeyNotConfigured.Error() || errString == validators.ErrDeviceNameNotConfigured.Error()
+		projectNameFlag := rootCmd.Flag("project-name").Value.String()
 
 		switch {
 		case requests.IsAPIKeyExpiredError(err):
 			fmt.Fprintln(os.Stderr, "The API key provided has expired. Obtain a new key from the Dashboard or run `stripe login` and try again.")
+		case isLoginRequiredError && projectNameFlag != "default":
+			fmt.Printf("You provided the project name \"%[1]s\" (either via the \"--project-name\" flag or the \"STRIPE_PROJECT_NAME\" environment variable), but no config for that project was found.\nPlease run `stripe login --project-name=%[1]s` to enable commands for this project.\n", projectNameFlag)
 		case isLoginRequiredError:
 			// capitalize first letter of error because linter
 			errRunes := []rune(errString)
@@ -111,7 +124,7 @@ func Execute(ctx context.Context) {
 
 			fmt.Printf("%s. Running `stripe login`...\n", string(errRunes))
 
-			err = login.Login(updatedCtx, stripe.DefaultDashboardBaseURL, &Config, os.Stdin)
+			err = login.Login(updatedCtx, stripe.DefaultDashboardBaseURL, &Config)
 
 			if err != nil {
 				fmt.Println(err)
@@ -134,8 +147,30 @@ func Execute(ctx context.Context) {
 	}
 }
 
+var keysToReBind []string
+
+// ReBindKeys applies the value found in viper config to the cobra flag when viper has a value (possibly from env)
+func ReBindKeys() {
+	for _, k := range keysToReBind {
+		if viper.IsSet(k) {
+			rootCmd.Flags().Set(k, viper.GetString(k))
+		}
+	}
+}
+
+// wraps viper's bindEnv and ensures we write values back to the Config
+// value precedence is:
+// 1. flag
+// 2. env
+// 3. default
+func bindEnv(key, envKey string) {
+	viper.BindPFlag(key, rootCmd.PersistentFlags().Lookup(key))
+	viper.BindEnv(key, envKey)
+	keysToReBind = append(keysToReBind, key)
+}
+
 func init() {
-	cobra.OnInitialize(Config.InitConfig)
+	cobra.OnInitialize(Config.InitConfig, ReBindKeys)
 
 	rootCmd.PersistentFlags().StringVar(&Config.Profile.APIKey, "api-key", "", "Your API key to use for the command")
 	rootCmd.PersistentFlags().StringVar(&Config.Color, "color", "", "turn on/off color output (on, off, auto)")
@@ -145,7 +180,12 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&Config.Profile.ProfileName, "project-name", "p", "default", "the project name to read from for config")
 	rootCmd.Flags().BoolP("version", "v", false, "Get the version of the Stripe CLI")
 
+	// tell viper to monitor the following flags:
+	// they will be available via viper.get(KEY), but not mapped back to the Config (by default; see below)
 	viper.BindPFlag("color", rootCmd.PersistentFlags().Lookup("color"))
+
+	// also, bind flags to the environment variables
+	bindEnv("project-name", "STRIPE_PROJECT_NAME")
 
 	rootCmd.AddCommand(newCompletionCmd().cmd)
 	rootCmd.AddCommand(newConfigCmd().cmd)
@@ -163,22 +203,18 @@ func init() {
 	rootCmd.AddCommand(newResourcesCmd().cmd)
 	rootCmd.AddCommand(newSamplesCmd().cmd)
 	rootCmd.AddCommand(newServeCmd().cmd)
-	rootCmd.AddCommand(newStatusCmd().cmd)
+	// current stripe status site is being deprecated
+	// hide status command until status site v2 is released
+	// rootCmd.AddCommand(newStatusCmd().cmd)
 	rootCmd.AddCommand(newTriggerCmd().cmd)
 	rootCmd.AddCommand(newVersionCmd().cmd)
-	rootCmd.AddCommand(newPlaybackCmd().cmd)
 	rootCmd.AddCommand(newPostinstallCmd(&Config).cmd)
 	rootCmd.AddCommand(newCommunityCmd().cmd)
 	rootCmd.AddCommand(newPluginCmd().cmd)
-
 	addAllResourcesCmds(rootCmd)
+	addV2BillingStubs(rootCmd)
 
-	err := resource.AddEventsSubCmds(rootCmd, &Config)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = resource.AddTerminalSubCmds(rootCmd, &Config)
+	err := resource.PostProcessResourceCommands(rootCmd, &Config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -189,7 +225,7 @@ func init() {
 	// get a list of installed plugins, validate against the manifest
 	// and finally add each validated plugin as a command
 	nfs := afero.NewOsFs()
-	pluginList := Config.Profile.GetInstalledPlugins()
+	pluginList := Config.GetInstalledPlugins()
 
 	for _, p := range pluginList {
 		plugin, err := plugins.LookUpPlugin(context.Background(), &Config, nfs, p)
@@ -197,4 +233,16 @@ func init() {
 			rootCmd.AddCommand(newPluginTemplateCmd(&Config, &plugin).cmd)
 		}
 	}
+}
+
+func addV2BillingStubs(rootCmd *cobra.Command) {
+	cmd, _, err := rootCmd.Find([]string{"billing"})
+	if err != nil {
+		// silently fail
+		return
+	}
+	rBillingMeterEventSessionCmd := resource.NewResourceCmd(cmd, "meter_event_session")
+	rBillingMeterEventStreamCmd := resource.NewResourceCmd(cmd, "meter_event_stream")
+	resource.NewUnsupportedV2BillingOperationCmd(rBillingMeterEventSessionCmd.Cmd, "create", "/v2/billing/meter_event_session")
+	resource.NewUnsupportedV2BillingOperationCmd(rBillingMeterEventStreamCmd.Cmd, "create", "/v2/billing/meter_event_stream")
 }

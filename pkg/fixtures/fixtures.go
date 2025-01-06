@@ -5,48 +5,49 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/imdario/mergo"
 	"github.com/joho/godotenv"
 	"github.com/spf13/afero"
 	"github.com/tidwall/gjson"
 
+	"github.com/stripe/stripe-cli/pkg/git"
+	"github.com/stripe/stripe-cli/pkg/parsers"
 	"github.com/stripe/stripe-cli/pkg/requests"
 )
 
 // SupportedVersions is the version number of the fixture template the CLI supports
 const SupportedVersions = 0
 
-type metaFixture struct {
+// MetaFixture contains fixture metadata
+type MetaFixture struct {
 	Version         int  `json:"template_version"`
 	ExcludeMetadata bool `json:"exclude_metadata"`
 }
 
-type fixtureFile struct {
-	Meta     metaFixture       `json:"_meta"`
-	Fixtures []fixture         `json:"fixtures"`
+// FixtureData contains the whole fixture file
+type FixtureData struct {
+	Meta     MetaFixture       `json:"_meta"`
+	Requests []FixtureRequest  `json:"fixtures"`
 	Env      map[string]string `json:"env"`
 }
 
-type fixture struct {
+// FixtureRequest is the individual request payload
+type FixtureRequest struct {
 	Name              string                 `json:"name"`
 	ExpectedErrorType string                 `json:"expected_error_type"`
 	Path              string                 `json:"path"`
 	Method            string                 `json:"method"`
 	Params            map[string]interface{} `json:"params"`
-}
-
-type fixtureQuery struct {
-	Match        string // The substring that matched the query pattern regex
-	Name         string
-	Query        string
-	DefaultValue string
+	IdempotencyKey    string                 `json:"idempotency_key,omitempty"`
+	Context           string                 `json:"context,omitempty"`
+	APIBase           string                 `json:"api_base,omitempty"`
+	Headers           map[string]string      `json:"headers,omitempty"`
 }
 
 // Fixture contains a mapping of an individual fixtures responses for querying
@@ -59,19 +60,18 @@ type Fixture struct {
 	Additions     map[string]interface{}
 	Removals      map[string]interface{}
 	BaseURL       string
-	responses     map[string]gjson.Result
-	fixture       fixtureFile
+	Responses     map[string]gjson.Result
+	FixtureData   FixtureData
 }
 
 // NewFixtureFromFile creates a to later run steps for populating test data
-func NewFixtureFromFile(fs afero.Fs, apiKey, stripeAccount, baseURL, file string, skip, override, add, remove []string) (*Fixture, error) {
+func NewFixtureFromFile(fs afero.Fs, apiKey, stripeAccount, baseURL, file string, skip, override, add, remove []string, edit bool) (*Fixture, error) {
 	fxt := Fixture{
 		Fs:            fs,
 		APIKey:        apiKey,
 		StripeAccount: stripeAccount,
-		Skip:          skip,
 		BaseURL:       baseURL,
-		responses:     make(map[string]gjson.Result),
+		Responses:     make(map[string]gjson.Result),
 	}
 
 	var filedata []byte
@@ -83,7 +83,7 @@ func NewFixtureFromFile(fs afero.Fs, apiKey, stripeAccount, baseURL, file string
 			return nil, err
 		}
 
-		filedata, err = ioutil.ReadAll(f)
+		filedata, err = io.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}
@@ -94,24 +94,39 @@ func NewFixtureFromFile(fs afero.Fs, apiKey, stripeAccount, baseURL, file string
 		}
 	}
 
-	err = json.Unmarshal(filedata, &fxt.fixture)
+	// Customize fixture data
+
+	if edit {
+		filedata, err = fxt.Edit(file, filedata)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = json.Unmarshal(filedata, &fxt.FixtureData)
 	if err != nil {
 		return nil, err
 	}
 
-	// Customize fixture data
-	if err := fxt.Override(override); err != nil {
-		return nil, err
-	}
-	if err := fxt.Add(add); err != nil {
-		return nil, err
-	}
-	if err := fxt.Remove(remove); err != nil {
-		return nil, err
+	if len(override) > 0 || len(add) > 0 || len(remove) > 0 || len(skip) > 0 {
+		if edit {
+			fmt.Println("Warning: --edit cannot be used with --add, --remove, --override, or --skip. Skipping those flags...")
+		} else {
+			if err := fxt.Override(override); err != nil {
+				return nil, err
+			}
+			if err := fxt.Add(add); err != nil {
+				return nil, err
+			}
+			if err := fxt.Remove(remove); err != nil {
+				return nil, err
+			}
+			fxt.Skip = skip
+		}
 	}
 
-	if fxt.fixture.Meta.Version > SupportedVersions {
-		return nil, fmt.Errorf("Fixture version not supported: %s", fmt.Sprint(fxt.fixture.Meta.Version))
+	if fxt.FixtureData.Meta.Version > SupportedVersions {
+		return nil, fmt.Errorf("Fixture version not supported: %s", fmt.Sprint(fxt.FixtureData.Meta.Version))
 	}
 
 	return &fxt, nil
@@ -125,16 +140,16 @@ func NewFixtureFromRawString(fs afero.Fs, apiKey, stripeAccount, baseURL, raw st
 		StripeAccount: stripeAccount,
 		Skip:          []string{},
 		BaseURL:       baseURL,
-		responses:     make(map[string]gjson.Result),
+		Responses:     make(map[string]gjson.Result),
 	}
 
-	err := json.Unmarshal([]byte(raw), &fxt.fixture)
+	err := json.Unmarshal([]byte(raw), &fxt.FixtureData)
 	if err != nil {
 		return nil, err
 	}
 
-	if fxt.fixture.Meta.Version > SupportedVersions {
-		return nil, fmt.Errorf("Fixture version not supported: %s", fmt.Sprint(fxt.fixture.Meta.Version))
+	if fxt.FixtureData.Meta.Version > SupportedVersions {
+		return nil, fmt.Errorf("Fixture version not supported: %s", fmt.Sprint(fxt.FixtureData.Meta.Version))
 	}
 
 	return &fxt, nil
@@ -142,7 +157,7 @@ func NewFixtureFromRawString(fs afero.Fs, apiKey, stripeAccount, baseURL, raw st
 
 // GetFixtureFileContent returns the file content of the given fixture file name
 func (fxt *Fixture) GetFixtureFileContent() string {
-	data, err := json.MarshalIndent(fxt.fixture, "", "  ")
+	data, err := json.MarshalIndent(fxt.FixtureData, "", "  ")
 	if err != nil {
 		return ""
 	}
@@ -171,7 +186,7 @@ func (e fixtureRewriteError) Error() string {
 	var nameError missingFixtureNameError
 	if errors.As(e.err, &nameError) {
 		fixtureNames := []string{}
-		for _, fixture := range e.fixture.fixture.Fixtures {
+		for _, fixture := range e.fixture.FixtureData.Requests {
 			fixtureNames = append(fixtureNames, fixture.Name)
 		}
 
@@ -198,7 +213,7 @@ func (fxt *Fixture) Override(overrides []string) error {
 	if err != nil {
 		return fixtureRewriteError{operation: "override", err: err, fixture: fxt}
 	}
-	for _, f := range fxt.fixture.Fixtures {
+	for _, f := range fxt.FixtureData.Requests {
 		if _, ok := data[f.Name]; ok {
 			if err := mergo.Merge(&f.Params, data[f.Name], mergo.WithOverride); err != nil {
 				fmt.Println(err)
@@ -214,9 +229,9 @@ func (fxt *Fixture) Override(overrides []string) error {
 // over. For that, `Override` should be used
 func (fxt *Fixture) Add(additions []string) error {
 	// If the params is empty, initialize it before merging with added data
-	for i, data := range fxt.fixture.Fixtures {
+	for i, data := range fxt.FixtureData.Requests {
 		if data.Method == "post" && data.Params == nil {
-			fxt.fixture.Fixtures[i].Params = make(map[string]interface{})
+			fxt.FixtureData.Requests[i].Params = make(map[string]interface{})
 		}
 	}
 
@@ -224,7 +239,7 @@ func (fxt *Fixture) Add(additions []string) error {
 	if err != nil {
 		return fixtureRewriteError{operation: "add", err: err, fixture: fxt}
 	}
-	for _, f := range fxt.fixture.Fixtures {
+	for _, f := range fxt.FixtureData.Requests {
 		if _, ok := data[f.Name]; ok {
 			if err := mergo.Merge(&f.Params, data[f.Name]); err != nil {
 				fmt.Println(err)
@@ -240,7 +255,7 @@ func (fxt *Fixture) Remove(removals []string) error {
 	if err != nil {
 		return fixtureRewriteError{operation: "remove", err: err, fixture: fxt}
 	}
-	for _, f := range fxt.fixture.Fixtures {
+	for _, f := range fxt.FixtureData.Requests {
 		if _, ok := data[f.Name]; ok {
 			for remove := range data[f.Name].(map[string]interface{}) {
 				delete(f.Params, remove)
@@ -250,11 +265,34 @@ func (fxt *Fixture) Remove(removals []string) error {
 	return nil
 }
 
+// Edit opens the fixture in the git's default IDE to edit directly
+func (fxt *Fixture) Edit(path string, filedata []byte) ([]byte, error) {
+	return Edit(path, filedata)
+}
+
+// Edit is separated into a var so we can mock this in fixtures_test
+var Edit = func(path string, filedata []byte) ([]byte, error) {
+	filename := getFixtureFilenameWithWildcard(path)
+	editor, err := git.NewTemporaryFileEditor(filename, filedata)
+	if err != nil {
+		return nil, err
+	}
+
+	return editor.EditContent()
+}
+
+func getFixtureFilenameWithWildcard(path string) string {
+	pathComponents := strings.Split(path, "/")
+	fixtureName := strings.Split(pathComponents[len(pathComponents)-1], ".")
+	// Add a wildcard that is replaced by a random string when passing this filename to os.CreateTemp
+	return strings.Join(fixtureName[0:len(fixtureName)-1], ".") + ".*." + fixtureName[len(fixtureName)-1]
+}
+
 // Execute takes the parsed fixture file and runs through all the requests
 // defined to populate the user's account
-func (fxt *Fixture) Execute(ctx context.Context) ([]string, error) {
-	requestNames := make([]string, len(fxt.fixture.Fixtures))
-	for i, data := range fxt.fixture.Fixtures {
+func (fxt *Fixture) Execute(ctx context.Context, apiVersion string) ([]string, error) {
+	requestNames := make([]string, len(fxt.FixtureData.Requests))
+	for i, data := range fxt.FixtureData.Requests {
 		if isNameIn(data.Name, fxt.Skip) {
 			fmt.Printf("Skipping fixture for: %s\n", data.Name)
 			continue
@@ -264,18 +302,20 @@ func (fxt *Fixture) Execute(ctx context.Context) ([]string, error) {
 		requestNames[i] = data.Name
 
 		fmt.Printf("Running fixture for: %s\n", data.Name)
-		resp, err := fxt.makeRequest(ctx, data)
+		resp, err := fxt.makeRequest(ctx, data, apiVersion)
 		if err != nil && !errWasExpected(err, data.ExpectedErrorType) {
 			return nil, err
 		}
 
-		fxt.responses[data.Name] = gjson.ParseBytes(resp)
+		fxt.Responses[data.Name] = gjson.ParseBytes(resp)
 	}
-
 	return requestNames, nil
 }
 
 func errWasExpected(err error, expectedErrorType string) bool {
+	if expectedErrorType == "" {
+		return false
+	}
 	if rerr, ok := err.(requests.RequestError); ok {
 		return rerr.ErrorType == expectedErrorType
 	}
@@ -285,47 +325,90 @@ func errWasExpected(err error, expectedErrorType string) bool {
 // UpdateEnv uses the results of the fixtures command just executed and
 // updates a local .env with the resulting data
 func (fxt *Fixture) UpdateEnv() error {
-	if len(fxt.fixture.Env) > 0 {
-		return fxt.updateEnv(fxt.fixture.Env)
+	if len(fxt.FixtureData.Env) > 0 {
+		return fxt.updateEnv(fxt.FixtureData.Env)
 	}
 
 	return nil
 }
 
-func (fxt *Fixture) makeRequest(ctx context.Context, data fixture) ([]byte, error) {
-	var rp requests.RequestParameters
-
-	if data.Method == "post" && !fxt.fixture.Meta.ExcludeMetadata {
-		now := time.Now().String()
-		metadata := fmt.Sprintf("metadata[_created_by_fixture]=%s", now)
-		rp.AppendData([]string{metadata})
+func (fxt *Fixture) getAPIBase(request FixtureRequest) string {
+	if request.APIBase != "" {
+		return request.APIBase
 	}
+	return fxt.BaseURL
+}
 
+func (fxt *Fixture) unsupportedAPIKey(path string) bool {
+	return strings.HasPrefix(path, "/v2/") && !strings.HasPrefix(fxt.APIKey, "sk_")
+}
+
+func (fxt *Fixture) addCustomHeaders(headers map[string]string) func(req *http.Request) error {
+	return func(req *http.Request) error {
+		for k, v := range headers {
+			value, err := parsers.ParseQuery(v, fxt.Responses)
+			if err != nil {
+				return fmt.Errorf("error parsing %s field: %w", k, err)
+			}
+			req.Header.Set(k, value)
+		}
+		return nil
+	}
+}
+
+func (fxt *Fixture) makeRequest(ctx context.Context, data FixtureRequest, apiVersion string) ([]byte, error) {
 	req := requests.Base{
 		Method:         strings.ToUpper(data.Method),
 		SuppressOutput: true,
-		APIBaseURL:     fxt.BaseURL,
-		Parameters:     rp,
+		APIBaseURL:     fxt.getAPIBase(data),
 	}
 
-	path, err := fxt.parsePath(data)
+	path, err := parsers.ParsePath(data.Path, fxt.Responses)
+
+	if fxt.unsupportedAPIKey(path) {
+		return make([]byte, 0), fmt.Errorf("this trigger must be run with a secret API key (starts with 'sk_')")
+	}
 
 	if err != nil {
 		return make([]byte, 0), err
 	}
 
-	params, err := fxt.createParams(data.Params)
-
+	params, err := fxt.createParams(data.Params, apiVersion)
 	if err != nil {
 		return make([]byte, 0), err
 	}
 
-	return req.MakeRequest(ctx, fxt.APIKey, path, params, true)
+	if data.IdempotencyKey != "" {
+		idempotencyKey, err := parsers.ParseQuery(data.IdempotencyKey, fxt.Responses)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing idempotency_key field: %w", err)
+		}
+		params.SetIdempotency(idempotencyKey)
+	}
+
+	var additionalConfigure func(req *http.Request) error
+	if data.Headers != nil {
+		additionalConfigure = fxt.addCustomHeaders(data.Headers)
+	}
+
+	if strings.HasPrefix(path, "/v2/") {
+		jsonPayload := ""
+		if strings.ToLower(data.Method) == "post" {
+			jsonPayload, err = fxt.createJSONPayload(data.Params)
+			if err != nil {
+				return make([]byte, 0), err
+			}
+		}
+
+		return req.MakeV2Request(ctx, fxt.APIKey, path, params, true, additionalConfigure, jsonPayload)
+	}
+
+	return req.MakeRequest(ctx, fxt.APIKey, path, params, true, additionalConfigure)
 }
 
-func (fxt *Fixture) createParams(params interface{}) (*requests.RequestParameters, error) {
+func (fxt *Fixture) createParams(params interface{}, apiVersion string) (*requests.RequestParameters, error) {
 	requestParams := requests.RequestParameters{}
-	parsed, err := fxt.parseInterface(params)
+	parsed, err := parsers.ParseToFormData(params, fxt.Responses)
 	if err != nil {
 		return &requestParams, err
 	}
@@ -333,31 +416,28 @@ func (fxt *Fixture) createParams(params interface{}) (*requests.RequestParameter
 
 	requestParams.SetStripeAccount(fxt.StripeAccount)
 
+	if apiVersion != "" {
+		requestParams.SetVersion(apiVersion)
+	}
+
 	return &requestParams, nil
 }
 
-func getEnvVar(query fixtureQuery) (string, error) {
-	key := query.Query
-	// Check if env variable is present
-	envValue := os.Getenv(key)
-	if envValue == "" {
-		// Try to load from .env file
-		dir, err := os.Getwd()
-		if err != nil {
-			dir = ""
-		}
-		err = godotenv.Load(path.Join(dir, ".env"))
-		if err != nil {
-			return "", nil
-		}
-		envValue = os.Getenv(key)
+func (fxt *Fixture) createJSONPayload(params interface{}) (string, error) {
+	if params == nil {
+		return "{}", nil
 	}
-	if envValue == "" {
-		fmt.Printf("No value for env var: %s\n", key)
-		return "", nil
+	parsedJSON, err := parsers.ParseToApplicationJSON(params, fxt.Responses)
+	if err != nil {
+		return "", err
 	}
 
-	return envValue, nil
+	jsonParams, err := json.Marshal(parsedJSON)
+	if err != nil {
+		return "", err
+	}
+
+	return string(jsonParams), nil
 }
 
 func (fxt *Fixture) updateEnv(env map[string]string) error {
@@ -385,7 +465,7 @@ func (fxt *Fixture) updateEnv(env map[string]string) error {
 	}
 
 	for key, value := range env {
-		parsed, err := fxt.parseQuery(value)
+		parsed, err := parsers.ParseQuery(value, fxt.Responses)
 		if err != nil {
 			return err
 		}

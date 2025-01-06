@@ -2,7 +2,8 @@ package stripe
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,7 +17,7 @@ func TestPerformRequest_ParamsEncoding_Delete(t *testing.T) {
 		require.Equal(t, "/delete", r.URL.Path)
 		require.Equal(t, "key_a=value_a&key_b=value_b", r.URL.RawQuery)
 
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		require.Equal(t, "", string(body))
 	}))
@@ -42,7 +43,7 @@ func TestPerformRequest_ParamsEncoding_Get(t *testing.T) {
 		require.Equal(t, "/get", r.URL.Path)
 		require.Equal(t, "key_a=value_a&key_b=value_b", r.URL.RawQuery)
 
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		require.Equal(t, "", string(body))
 	}))
@@ -68,7 +69,7 @@ func TestPerformRequest_ParamsEncoding_Post(t *testing.T) {
 		require.Equal(t, "/post", r.URL.Path)
 		require.Equal(t, "", r.URL.RawQuery)
 
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		require.Equal(t, "key_a=value_a&key_b=value_b", string(body))
 	}))
@@ -135,10 +136,33 @@ func TestPerformRequest_ConfigureFunc(t *testing.T) {
 		BaseURL: baseURL,
 	}
 
-	resp, err := client.PerformRequest(context.Background(), http.MethodGet, "/get", "", func(r *http.Request) {
+	resp, err := client.PerformRequest(context.Background(), http.MethodGet, "/get", "", func(r *http.Request) error {
 		r.Header.Add("Stripe-Version", "2019-07-10")
+		return nil
 	})
 	require.NoError(t, err)
 
 	defer resp.Body.Close()
+}
+
+func TestPerformRequest_ConfigureFuncReturnsError(t *testing.T) {
+	serverCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalled = true
+	}))
+	defer ts.Close()
+
+	baseURL, _ := url.Parse(ts.URL)
+	client := Client{
+		BaseURL: baseURL,
+	}
+
+	resp, err := client.PerformRequest(context.Background(), http.MethodGet, "/get", "", func(r *http.Request) error {
+		return errors.New("foo")
+	})
+	require.Equal(t, errors.New("foo"), err)
+	require.False(t, serverCalled)
+	if resp != nil {
+		resp.Body.Close()
+	}
 }

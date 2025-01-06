@@ -3,7 +3,7 @@ package spec
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 )
 
 //
@@ -89,11 +89,14 @@ var supportedSchemaFields = []string{
 	"x-expansionResources",
 	"x-resourceId",
 	"x-stripeOperations",
+	"x-stripeMostCommon",
 
 	// This is currently being used to store additional metadata for our SDKs. It's
 	// passed through our Spec and should be ignored
 	"x-stripeParam",
 	"x-stripeResource",
+	"x-stripeEvent",
+	"deprecated",
 
 	// This is currently a hint for the server-side so I haven't included it in
 	// Schema yet. If we do start validating responses that come out of
@@ -130,6 +133,7 @@ type Schema struct {
 	XExpansionResources *ExpansionResources `json:"x-expansionResources,omitempty"`
 	XResourceID         string              `json:"x-resourceId,omitempty"`
 	XStripeOperations   *[]StripeOperation  `json:"x-stripeOperations,omitempty"`
+	XStripeMostCommon   []string            `json:"x-stripeMostCommon,omitempty"`
 }
 
 func (s *Schema) String() string {
@@ -243,7 +247,7 @@ type StatusCode string
 
 // LoadSpec loads and returns the OpenAPI spec.
 func LoadSpec(specPath string) (*Spec, error) {
-	data, err := ioutil.ReadFile(specPath)
+	data, err := os.ReadFile(specPath)
 	if err != nil {
 		return nil, err
 	}

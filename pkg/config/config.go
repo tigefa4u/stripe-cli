@@ -3,15 +3,12 @@ package config
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
-	exec "golang.org/x/sys/execabs"
-
+	"github.com/99designs/keyring"
 	"github.com/BurntSushi/toml"
 	"github.com/mitchellh/go-homedir"
 	log "github.com/sirupsen/logrus"
@@ -19,6 +16,7 @@ import (
 	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 
 	"github.com/stripe/stripe-cli/pkg/ansi"
+	"github.com/stripe/stripe-cli/pkg/git"
 )
 
 // ColorOn represnets the on-state for colors
@@ -40,6 +38,7 @@ type IConfig interface {
 	RemoveProfile(profileName string) error
 	RemoveAllProfiles() error
 	WriteConfigField(field string, value interface{}) error
+	GetInstalledPlugins() []string
 }
 
 // Config handles all overall configuration for the CLI
@@ -62,11 +61,6 @@ func (c *Config) GetProfile() *Profile {
 func (c *Config) GetConfigFolder(xdgPath string) string {
 	configPath := xdgPath
 
-	log.WithFields(log.Fields{
-		"prefix": "config.Config.GetProfilesFolder",
-		"path":   configPath,
-	}).Debug("Using profiles file")
-
 	if configPath == "" {
 		home, err := homedir.Dir()
 		if err != nil {
@@ -77,7 +71,14 @@ func (c *Config) GetConfigFolder(xdgPath string) string {
 		configPath = filepath.Join(home, ".config")
 	}
 
-	return filepath.Join(configPath, "stripe")
+	stripeConfigPath := filepath.Join(configPath, "stripe")
+
+	log.WithFields(log.Fields{
+		"prefix": "config.Config.GetProfilesFolder",
+		"path":   stripeConfigPath,
+	}).Debug("Using profiles file")
+
+	return stripeConfigPath
 }
 
 // InitConfig reads in profiles file and ENV variables if set.
@@ -85,6 +86,24 @@ func (c *Config) InitConfig() {
 	logFormatter := &prefixed.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: time.RFC1123,
+	}
+
+	log.SetFormatter(logFormatter)
+
+	// Set log level
+	switch c.LogLevel {
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "info":
+		log.SetLevel(log.InfoLevel)
+	case "trace":
+		log.SetLevel(log.TraceLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	default:
+		log.Fatalf("Unrecognized log level value: %s. Expected one of debug, info, warn, error.", c.LogLevel)
 	}
 
 	if c.ProfilesFile != "" {
@@ -111,6 +130,12 @@ func (c *Config) InitConfig() {
 			"prefix": "config.Config.InitConfig",
 			"path":   viper.ConfigFileUsed(),
 		}).Debug("Using profiles file")
+	}
+
+	if os.Getenv("STRIPE_CLI_CANARY") == "true" {
+		log.WithFields(log.Fields{
+			"prefix": "config.Config.InitConfig",
+		}).Debug("Running with STRIPE_CLI_CANARY=true")
 	}
 
 	if c.Profile.DeviceName == "" {
@@ -140,70 +165,44 @@ func (c *Config) InitConfig() {
 		log.Fatalf("Unrecognized color value: %s. Expected one of on, off, auto.", c.Color)
 	}
 
-	log.SetFormatter(logFormatter)
+	// initialize key ring
+	KeyRing, _ = keyring.Open(keyring.Config{
+		ServiceName: KeyManagementService,
+	})
 
-	// Set log level
-	switch c.LogLevel {
-	case "debug":
-		log.SetLevel(log.DebugLevel)
-	case "info":
-		log.SetLevel(log.InfoLevel)
-	case "trace":
-		log.SetLevel(log.TraceLevel)
-	case "warn":
-		log.SetLevel(log.WarnLevel)
-	case "error":
-		log.SetLevel(log.ErrorLevel)
-	default:
-		log.Fatalf("Unrecognized log level value: %s. Expected one of debug, info, warn, error.", c.LogLevel)
-	}
+	// redact livemode values for existing configs
+	c.Profile.redactAllLivemodeValues()
 }
 
 // EditConfig opens the configuration file in the default editor.
 func (c *Config) EditConfig() error {
-	var err error
-
 	fmt.Println("Opening config file:", c.ProfilesFile)
 
-	switch runtime.GOOS {
-	case "darwin", "linux":
-		editor := os.Getenv("EDITOR")
-		if editor == "" {
-			editor = "vi"
-		}
-
-		cmd := exec.Command(editor, c.ProfilesFile)
-		// Some editors detect whether they have control of stdin/out and will
-		// fail if they do not.
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-
-		return cmd.Run()
-	case "windows":
-		// As far as I can tell, Windows doesn't have an easily accesible or
-		// comparable option to $EDITOR, so default to notepad for now
-		err = exec.Command("notepad", c.ProfilesFile).Run()
-	default:
-		err = fmt.Errorf("unsupported platform")
+	editor, err := git.NewEditor(c.ProfilesFile)
+	if err != nil {
+		return err
 	}
 
+	_, err = editor.EditContent()
 	return err
 }
 
 // PrintConfig outputs the contents of the configuration file.
 func (c *Config) PrintConfig() error {
-	if c.Profile.ProfileName == "default" {
-		configFile, err := ioutil.ReadFile(c.ProfilesFile)
+	profileName := c.Profile.ProfileName
+
+	if profileName == "default" {
+		configFile, err := os.ReadFile(c.ProfilesFile)
 		if err != nil {
 			return err
 		}
 
 		fmt.Print(string(configFile))
 	} else {
-		configs := viper.GetStringMapString(c.Profile.ProfileName)
+		configs := viper.GetStringMapString(profileName)
 
 		if len(configs) > 0 {
-			fmt.Printf("[%s]\n", c.Profile.ProfileName)
+			fmt.Printf("[%s]\n", profileName)
 			for field, value := range configs {
 				fmt.Printf("  %s=%s\n", field, value)
 			}
@@ -211,6 +210,14 @@ func (c *Config) PrintConfig() error {
 	}
 
 	return nil
+}
+
+// GetInstalledPlugins returns a list of locally installed plugins.
+// This does not vary by profile
+func (c *Config) GetInstalledPlugins() []string {
+	runtimeViper := viper.GetViper()
+
+	return runtimeViper.GetStringSlice("installed_plugins")
 }
 
 // RemoveProfile removes the profile whose name matches the provided
@@ -225,6 +232,8 @@ func (c *Config) RemoveProfile(profileName string) error {
 			if err != nil {
 				return err
 			}
+
+			deleteLivemodeKey(LiveModeAPIKeyName, field)
 		}
 	}
 
@@ -242,10 +251,27 @@ func (c *Config) RemoveAllProfiles() error {
 			if err != nil {
 				return err
 			}
+
+			deleteLivemodeKey(LiveModeAPIKeyName, field)
 		}
 	}
 
 	return syncConfig(runtimeViper)
+}
+
+func deleteLivemodeKey(key string, profile string) error {
+	fieldID := profile + "." + key
+	existingKeys, err := KeyRing.Keys()
+	if err != nil {
+		return err
+	}
+	for _, item := range existingKeys {
+		if item == fieldID {
+			KeyRing.Remove(fieldID)
+			return nil
+		}
+	}
+	return nil
 }
 
 // isProfile identifies whether a value in the config pertains to a profile.

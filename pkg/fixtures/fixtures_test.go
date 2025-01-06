@@ -28,6 +28,7 @@ const testFixture = `
 			"name": "cust_bender",
 			"path": "/v1/customers",
 			"method": "post",
+			"idempotency_key": "create_cust_bender",
 			"params": {
 				"name": "Bender Bending Rodriguez",
 				"email": "bender@planex.com",
@@ -90,6 +91,14 @@ func TestMakeRequest(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		switch url := req.URL.String(); url {
 		case customersPath:
+			if req.Header.Get("Idempotency-Key") == "" {
+				t.Errorf("Idempotency key not sent")
+			}
+
+			if err := req.ParseForm(); err != nil {
+				t.Error(err)
+			}
+
 			res.Write([]byte(`{"id": "cust_12345", "foo": "bar"}`))
 		case chargePath:
 			res.Write([]byte(`{"charge": true, "id": "char_12345"}`))
@@ -104,19 +113,19 @@ func TestMakeRequest(t *testing.T) {
 
 	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
 
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 
-	require.NotNil(t, fxt.responses["cust_bender"])
-	require.NotNil(t, fxt.responses["char_bender"])
-	require.NotNil(t, fxt.responses["capt_bender"])
+	require.NotNil(t, fxt.Responses["cust_bender"])
+	require.NotNil(t, fxt.Responses["char_bender"])
+	require.NotNil(t, fxt.Responses["capt_bender"])
 
-	require.Equal(t, "cust_12345", fxt.responses["cust_bender"].Get("id").String())
-	require.Equal(t, "char_12345", fxt.responses["char_bender"].Get("id").String())
-	require.True(t, fxt.responses["char_bender"].Get("charge").Bool())
+	require.Equal(t, "cust_12345", fxt.Responses["cust_bender"].Get("id").String())
+	require.Equal(t, "char_12345", fxt.Responses["char_bender"].Get("id").String())
+	require.True(t, fxt.Responses["char_bender"].Get("charge").Bool())
 }
 
 func TestMakeRequestWithStringFixture(t *testing.T) {
@@ -139,16 +148,16 @@ func TestMakeRequestWithStringFixture(t *testing.T) {
 	fxt, err := NewFixtureFromRawString(fs, apiKey, "", ts.URL, testFixture)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 
-	require.NotNil(t, fxt.responses["cust_bender"])
-	require.NotNil(t, fxt.responses["char_bender"])
-	require.NotNil(t, fxt.responses["capt_bender"])
+	require.NotNil(t, fxt.Responses["cust_bender"])
+	require.NotNil(t, fxt.Responses["char_bender"])
+	require.NotNil(t, fxt.Responses["capt_bender"])
 
-	require.Equal(t, "cust_12345", fxt.responses["cust_bender"].Get("id").String())
-	require.Equal(t, "char_12345", fxt.responses["char_bender"].Get("id").String())
-	require.True(t, fxt.responses["char_bender"].Get("charge").Bool())
+	require.Equal(t, "cust_12345", fxt.Responses["cust_bender"].Get("id").String())
+	require.Equal(t, "char_12345", fxt.Responses["char_bender"].Get("id").String())
+	require.True(t, fxt.Responses["char_bender"].Get("charge").Bool())
 }
 
 func TestWithSkipMakeRequest(t *testing.T) {
@@ -166,15 +175,15 @@ func TestWithSkipMakeRequest(t *testing.T) {
 
 	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
 
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{"char_bender", "capt_bender"}, []string{}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{"char_bender", "capt_bender"}, []string{}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 
-	require.True(t, fxt.responses["cust_bender"].Exists())
-	require.False(t, fxt.responses["char_bender"].Exists())
-	require.False(t, fxt.responses["capt_bender"].Exists())
+	require.True(t, fxt.Responses["cust_bender"].Exists())
+	require.False(t, fxt.Responses["char_bender"].Exists())
+	require.False(t, fxt.Responses["capt_bender"].Exists())
 }
 
 func TestMakeRequestWithOverride(t *testing.T) {
@@ -207,10 +216,10 @@ func TestMakeRequestWithOverride(t *testing.T) {
 
 	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
 
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{"cust_bender:name=Fry", "char_bender:amount=3000"}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{"cust_bender:name=Fry", "char_bender:amount=3000"}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 }
 
@@ -252,10 +261,11 @@ func TestMakeRequestWithAdd(t *testing.T) {
 			"capt_bender:nested1.nested2.nested3=nestedValue",
 		},
 		[]string{},
+		false,
 	)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 }
 
@@ -290,10 +300,10 @@ func TestMakeRequestWithRemove(t *testing.T) {
 	fxt, err := NewFixtureFromFile(
 		fs, apiKey, "", ts.URL, file, []string{}, []string{},
 		[]string{}, []string{"cust_bender:phone", "char_bender:capture"},
-	)
+		false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 }
 
@@ -306,12 +316,12 @@ func TestMakeRequestExpectedFailure(t *testing.T) {
 
 	defer func() { ts.Close() }()
 	afero.WriteFile(fs, "failured_test_fixture.json", []byte(failureTestFixture), os.ModePerm)
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, "failured_test_fixture.json", []string{}, []string{}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, "failured_test_fixture.json", []string{}, []string{}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
-	require.NotNil(t, fxt.responses["charge_expected_failure"])
+	require.NotNil(t, fxt.Responses["charge_expected_failure"])
 }
 
 func TestMakeRequestUnexpectedFailure(t *testing.T) {
@@ -323,10 +333,10 @@ func TestMakeRequestUnexpectedFailure(t *testing.T) {
 
 	defer func() { ts.Close() }()
 	afero.WriteFile(fs, "failured_test_fixture.json", []byte(failureTestFixture), os.ModePerm)
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, "failured_test_fixture.json", []string{}, []string{}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, "failured_test_fixture.json", []string{}, []string{}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	_, err = fxt.Execute(context.Background())
+	_, err = fxt.Execute(context.Background(), "")
 	require.NotNil(t, err)
 }
 
@@ -334,7 +344,7 @@ func TestUpdateEnv(t *testing.T) {
 	fs := afero.NewMemMapFs()
 	fxt := Fixture{
 		Fs: fs,
-		responses: map[string]gjson.Result{
+		Responses: map[string]gjson.Result{
 			"char_bender": gjson.Parse(`{"id": "char_12345"}`),
 			"cust_bender": gjson.Parse(`{"id": "cust_12345"}`),
 		},
@@ -358,66 +368,6 @@ CUST_ID="char_12345"`
 	assert.Equal(t, expected, string(output))
 }
 
-func TestToFixtureQuery(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected fixtureQuery
-		didMatch bool
-	}{
-		{
-			"/v1/charges",
-			fixtureQuery{},
-			false,
-		},
-		{
-			"/v1/charges/${char_bender:id}/capture",
-			fixtureQuery{"${char_bender:id}", "char_bender", "id", ""},
-			true,
-		},
-		{
-			"${.env:PHONE_NOT_SET|+1234567890}",
-			fixtureQuery{"${.env:PHONE_NOT_SET|+1234567890}", ".env", "PHONE_NOT_SET", "+1234567890"},
-			true,
-		},
-		{
-			"/v1/customers/${.env:CUST_ID}",
-			fixtureQuery{"${.env:CUST_ID}", ".env", "CUST_ID", ""},
-			true,
-		},
-		{
-			"${.env:CUST_ID}",
-			fixtureQuery{"${.env:CUST_ID}", ".env", "CUST_ID", ""},
-			true,
-		},
-		{
-			"${cust_bender:subscriptions.data.[0].id}",
-			fixtureQuery{"${cust_bender:subscriptions.data.[0].id}", "cust_bender", "subscriptions.data.[0].id", ""},
-			true,
-		},
-		{
-			"${cust_bender:subscriptions.data.[0].name|Unknown Person}",
-			fixtureQuery{"${cust_bender:subscriptions.data.[0].name|Unknown Person}", "cust_bender", "subscriptions.data.[0].name", "Unknown Person"},
-			true,
-		},
-		{
-			"${cust_bender:billing_details.address.country}",
-			fixtureQuery{"${cust_bender:billing_details.address.country}", "cust_bender", "billing_details.address.country", ""},
-			true,
-		},
-		{
-			"${cust_bender:billing_details.address.country|San Mateo}",
-			fixtureQuery{"${cust_bender:billing_details.address.country|San Mateo}", "cust_bender", "billing_details.address.country", "San Mateo"},
-			true,
-		},
-	}
-
-	for _, test := range tests {
-		actualQuery, actualDidMatch := toFixtureQuery(test.input)
-		assert.Equal(t, test.expected, actualQuery)
-		assert.Equal(t, test.didMatch, actualDidMatch)
-	}
-}
-
 func TestExecuteReturnsRequestNames(t *testing.T) {
 	fs := afero.NewMemMapFs()
 	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
@@ -437,19 +387,19 @@ func TestExecuteReturnsRequestNames(t *testing.T) {
 
 	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
 
-	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{}, []string{}, []string{})
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{}, []string{}, []string{}, false)
 	require.NoError(t, err)
 
-	requestNames, err := fxt.Execute(context.Background())
+	requestNames, err := fxt.Execute(context.Background(), "")
 	require.NoError(t, err)
 
-	require.NotNil(t, fxt.responses["cust_bender"])
-	require.NotNil(t, fxt.responses["char_bender"])
-	require.NotNil(t, fxt.responses["capt_bender"])
+	require.NotNil(t, fxt.Responses["cust_bender"])
+	require.NotNil(t, fxt.Responses["char_bender"])
+	require.NotNil(t, fxt.Responses["capt_bender"])
 
-	require.Equal(t, "cust_12345", fxt.responses["cust_bender"].Get("id").Str)
-	require.Equal(t, "char_12345", fxt.responses["char_bender"].Get("id").Str)
-	require.Equal(t, "", fxt.responses["char_bender"].Get("charge").Str)
+	require.Equal(t, "cust_12345", fxt.Responses["cust_bender"].Get("id").Str)
+	require.Equal(t, "char_12345", fxt.Responses["char_bender"].Get("id").Str)
+	require.Equal(t, "", fxt.Responses["char_bender"].Get("charge").Str)
 
 	expectedResponseNames := []string{"cust_bender", "char_bender", "capt_bender"}
 	assert.Equal(t, expectedResponseNames, requestNames)
@@ -476,14 +426,14 @@ func TestFixtureAdd(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Add([]string{"price:amount=1200"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{"amount": 100})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{"amount": 100})
 	})
 
 	t.Run("new value", func(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Add([]string{"price:currency=usd"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{"amount": 100, "currency": "usd"})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{"amount": 100, "currency": "usd"})
 	})
 }
 
@@ -508,14 +458,14 @@ func TestFixtureOverride(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Override([]string{"price:amount=1200"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{"amount": "1200"})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{"amount": "1200"})
 	})
 
 	t.Run("new value", func(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Override([]string{"price:currency=usd"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{"amount": 100, "currency": "usd"})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{"amount": 100, "currency": "usd"})
 	})
 }
 
@@ -532,23 +482,197 @@ func TestFixtureRemove(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Remove([]string{"price:amount"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{})
 	})
 
 	t.Run("new value", func(t *testing.T) {
 		fxt := priceFixture()
 		err := fxt.Remove([]string{"price:currency"})
 		assert.NoError(t, err)
-		assert.Equal(t, fxt.fixture.Fixtures[0].Params, map[string]interface{}{"amount": 100})
+		assert.Equal(t, fxt.FixtureData.Requests[0].Params, map[string]interface{}{"amount": 100})
 	})
 }
 
 func priceFixture() *Fixture {
 	return &Fixture{
-		fixture: fixtureFile{
-			Fixtures: []fixture{
+		FixtureData: FixtureData{
+			Requests: []FixtureRequest{
 				{Name: "price", Params: map[string]interface{}{"amount": 100}},
 			},
 		},
 	}
+}
+
+func TestGetFixtureFilenameWithWildcard(t *testing.T) {
+	t.Run("account.updated", func(t *testing.T) {
+		assert.Equal(t, getFixtureFilenameWithWildcard("triggers/account.updated.json"), "account.updated.*.json")
+	})
+	t.Run("charge.dispute.created", func(t *testing.T) {
+		assert.Equal(t, getFixtureFilenameWithWildcard("triggers/charge.dispute.created.json"), "charge.dispute.created.*.json")
+	})
+	t.Run("payment_intent.amount_capturable_updated", func(t *testing.T) {
+		assert.Equal(t, getFixtureFilenameWithWildcard("triggers/payment_intent.amount_capturable_updated.json"), "payment_intent.amount_capturable_updated.*.json")
+	})
+}
+
+// Mock edit so that we don't try to open the fixture in an IDE during testing
+func mockEdit() {
+	Edit = func(path string, filedata []byte) ([]byte, error) {
+		return filedata, nil
+	}
+}
+
+func TestSkipSkipFlagIfEditIsTrue(t *testing.T) {
+	mockEdit()
+	fs := afero.NewMemMapFs()
+	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		switch url := req.URL.String(); url {
+		case capturePath:
+			res.Write([]byte(`{}`))
+		case chargePath:
+			res.Write([]byte(`{"charge": true, "id": "char_12345"}`))
+		case customersPath:
+			res.Write([]byte(`{"id": "cust_12345", "foo": "bar"}`))
+		default:
+			t.Errorf("Received an unexpected request URL: %s", req.URL.String())
+		}
+	}))
+
+	defer func() { ts.Close() }()
+
+	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
+
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{"char_bender", "capt_bender"}, []string{}, []string{}, []string{}, true)
+	require.NoError(t, err)
+
+	_, err = fxt.Execute(context.Background(), "")
+	require.NoError(t, err)
+
+	require.True(t, fxt.Responses["cust_bender"].Exists())
+	require.True(t, fxt.Responses["char_bender"].Exists())
+	require.True(t, fxt.Responses["capt_bender"].Exists())
+}
+
+func TestSkipOverrideFlagIfEditIsTrue(t *testing.T) {
+	mockEdit()
+	fs := afero.NewMemMapFs()
+	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Errorf("Failure with request body: %s", err)
+		}
+
+		switch url := req.URL.String(); url {
+		case customersPath:
+			res.Write([]byte(`{"id": "cust_12345", "foo": "bar"}`))
+
+			require.False(t, strings.Contains(string(body), "name=Fry"))
+			require.True(t, strings.Contains(string(body), "name=Bender"))
+		case chargePath:
+			res.Write([]byte(`{"charge": true, "id": "char_12345"}`))
+
+			require.False(t, strings.Contains(string(body), "amount=3000"))
+			require.True(t, strings.Contains(string(body), "amount=100"))
+		case capturePath:
+			// Do nothing, we just want to verify this request came in
+		default:
+			t.Errorf("Received an unexpected request URL: %s", req.URL.String())
+		}
+	}))
+
+	defer func() { ts.Close() }()
+
+	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
+
+	fxt, err := NewFixtureFromFile(fs, apiKey, "", ts.URL, file, []string{}, []string{"cust_bender:name=Fry", "char_bender:amount=3000"}, []string{}, []string{}, true)
+	require.NoError(t, err)
+
+	_, err = fxt.Execute(context.Background(), "")
+	require.NoError(t, err)
+}
+
+func TestSkipAddFlagIfEditIsTrue(t *testing.T) {
+	mockEdit()
+	fs := afero.NewMemMapFs()
+	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Errorf("Failure with request body: %s", err)
+		}
+
+		switch url := req.URL.String(); url {
+		case customersPath:
+			res.Write([]byte(`{"id": "cust_12345", "foo": "bar"}`))
+			require.False(t, strings.Contains(string(body), "birthdate=2996-09-04"))
+		case chargePath:
+			res.Write([]byte(`{"charge": true, "id": "char_12345"}`))
+			require.False(t, strings.Contains(string(body), "receipt_email=prof.farnsworth%40planex.com"))
+		case capturePath:
+			res.Write([]byte(`{}`))
+			require.False(t, strings.Contains(string(body), "statement_descriptor=Fuel%3A+Beer"))
+			require.False(t, strings.Contains(string(body), "nested1[nested2][nested3]=nestedValue"))
+
+		default:
+			t.Errorf("Received an unexpected request URL: %s", req.URL.String())
+		}
+	}))
+
+	defer func() { ts.Close() }()
+
+	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
+
+	fxt, err := NewFixtureFromFile(
+		fs, apiKey, "", ts.URL, file,
+		[]string{}, []string{}, []string{
+			"cust_bender:birthdate=2996-09-04",
+			"char_bender:receipt_email=prof.farnsworth@planex.com",
+			"capt_bender:statement_descriptor=Fuel: Beer",
+			"capt_bender:nested1.nested2.nested3=nestedValue",
+		},
+		[]string{},
+		true,
+	)
+	require.NoError(t, err)
+
+	_, err = fxt.Execute(context.Background(), "")
+	require.NoError(t, err)
+}
+
+func TestSkipRemoveFlagIfEditIsTrue(t *testing.T) {
+	mockEdit()
+	fs := afero.NewMemMapFs()
+	ts := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Errorf("Failure with request body: %s", err)
+		}
+
+		switch url := req.URL.String(); url {
+		case customersPath:
+			res.Write([]byte(`{"id": "cust_12345", "foo": "bar"}`))
+
+			require.True(t, strings.Contains(string(body), "phone"))
+		case chargePath:
+			res.Write([]byte(`{"charge": true, "id": "char_12345"}`))
+
+			require.True(t, strings.Contains(string(body), "capture"))
+		case capturePath:
+			// Do nothing, we just want to verify this request came in
+		default:
+			t.Errorf("Received an unexpected request URL: %s", req.URL.String())
+		}
+	}))
+
+	defer func() { ts.Close() }()
+
+	afero.WriteFile(fs, file, []byte(testFixture), os.ModePerm)
+
+	fxt, err := NewFixtureFromFile(
+		fs, apiKey, "", ts.URL, file, []string{}, []string{},
+		[]string{}, []string{"cust_bender:phone", "char_bender:capture"},
+		true)
+	require.NoError(t, err)
+
+	_, err = fxt.Execute(context.Background(), "")
+	require.NoError(t, err)
 }

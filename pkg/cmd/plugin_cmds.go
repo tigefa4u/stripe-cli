@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -29,16 +30,32 @@ func newPluginTemplateCmd(config *config.Config, plugin *plugins.Plugin) *plugin
 	ptc.cfg = config
 
 	ptc.cmd = &cobra.Command{
-		Use:         plugin.Shortname,
-		Short:       plugin.Shortdesc,
-		RunE:        ptc.runPluginCmd,
+		Use:   plugin.Shortname,
+		Short: plugin.Shortdesc,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// "stripe [host_flags...] plugin_name [plugin_subcommands...] [plugin_flags...]" => "[plugin_subcommands...] [plugin_flags...]"
+			pluginArgs := subsliceAfter(os.Args, cmd.Name())
+			return ptc.runPluginCmd(cmd, pluginArgs)
+		},
 		Annotations: map[string]string{"scope": "plugin"},
+		FParseErrWhitelist: cobra.FParseErrWhitelist{
+			UnknownFlags: true,
+		},
 	}
 
 	// override the CLI's help command and let the plugin supply the help text instead
-	ptc.cmd.SetHelpCommand(&cobra.Command{
-		Use:    "no-help",
-		Hidden: true,
+	ptc.cmd.SetHelpFunc(func(c *cobra.Command, s []string) {
+		var args []string
+		if len(s) == 0 {
+			// "stripe help plugin_name [plugin_subcommands...]" => "[plugin_subcommands...] --help"
+			args = subsliceAfter(os.Args, c.Name())
+			args = append(args, "--help")
+			c.SetContext(context.Background())
+		} else {
+			// "stripe plugin_name [plugin_subcommands...] --help" => "[plugin_subcommands...] --help"
+			args = subsliceAfter(s, c.Name())
+		}
+		ptc.runPluginCmd(c, args)
 	})
 
 	return ptc
@@ -52,14 +69,18 @@ func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string) er
 		}).Debug("Ctrl+C received, cleaning up...")
 	})
 
-	ptc.ParsedArgs = os.Args[2:]
+	ptc.ParsedArgs = args
 
 	fs := afero.NewOsFs()
-	plugin, err := plugins.LookUpPlugin(ctx, ptc.cfg, fs, cmd.CalledAs())
+	plugin, err := plugins.LookUpPlugin(ctx, ptc.cfg, fs, ptc.cmd.Name())
 
 	if err != nil {
 		return err
 	}
+
+	log.WithFields(log.Fields{
+		"prefix": "cmd.pluginCmd.runPluginCmd",
+	}).Debug("Running plugin...")
 
 	err = plugin.Run(ctx, ptc.cfg, fs, ptc.ParsedArgs)
 	plugins.CleanupAllClients()
@@ -72,7 +93,24 @@ func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string) er
 		log.WithFields(log.Fields{
 			"prefix": "pluginTemplateCmd.runPluginCmd",
 		}).Debug(fmt.Sprintf("Plugin command '%s' exited with error: %s", plugin.Shortname, err))
+
+		// We can't return err because the plugin will have already printed the error message at
+		// this point, and we can't return nil because the host will exit with code 0.
+		os.Exit(1)
 	}
 
 	return nil
+}
+
+// Return a copy of sl strictly after the first occurrence of str, or empty slice if not found.
+func subsliceAfter(sl []string, str string) []string {
+	for i, s := range sl {
+		if s == str {
+			subsl := sl[i+1:]
+			res := make([]string, len(subsl))
+			copy(res, subsl)
+			return res
+		}
+	}
+	return make([]string, 0)
 }

@@ -48,6 +48,59 @@ docker run --rm -it stripe/stripe-cli version
 stripe version x.y.z (beta)
 ```
 
+**Password Store Setup with Docker**
+
+While test mode doesn’t require password store, you will need to set it up if you wish to perform live mode requests.
+
+> You can also make live mode requests on a per command basis by attaching the `--api-key` flag.
+
+1. Create `entrypoint.sh`
+
+```sh
+#!/bin/sh
+if ! [ -f ~/.gnupg/trustdb.gpg ] ; then
+  chmod 700 ~/.gnupg/
+  gpg --quick-generate-key stripe-live # This will generate a gpg key called "stripe-live"
+fi
+if ! [ -f ~/.password-store/.gpg-id ] ; then
+  pass init stripe-live # This will initialize a password store record named "stripe-live", using the gpg key above
+  pass insert stripe-live # This will insert value for the password store "stripe-live", which we will put Stripe Live Secret Key in
+fi
+
+string="$@"
+liveflag="--live"
+
+if [ -z "${string##*$liveflag*}" ] ;then
+  OPTS="--api-key $(pass show stripe-live)" # This will use the content of the password store "stripe-live" which was inserted in line 8
+fi
+
+#pass insert stripe-live
+/bin/stripe  $@ $OPTS
+```
+
+2. Create a docker file `Dockerfile-cli`
+
+```sh
+FROM  stripe/stripe-cli:vx.x.x
+RUN  apk  add  pass  gpg-agent
+COPY  ./entrypoint.sh  /entrypoint.sh
+ENTRYPOINT  [ "/entrypoint.sh" ]
+```
+
+3. Build the docker image
+
+```sh
+docker build -t stripe-cli -f Dockerfile-cli .
+```
+
+4. Run the docker image with password volumes, replacing `$command` with the appropraite Stripe CLI command (i.e `customers list`)
+
+```sh
+docker run --rm -it -v stripe-config://root/.config/stripe/ -v stripe-gpg://root/.gnupg/ -v stripe-pass://root/.password-store/ stripe-cli $command
+``` 
+
+> For live mode requests append `--live` after `$command`.
+
 ### Without package managers
 
 Instructions are also available for installing and using the CLI [without a package manager](https://github.com/stripe/stripe-cli/wiki/Installing-and-updating#without-a-package-manager).
@@ -65,7 +118,7 @@ stripe [command] help
 
 ## Commands
 
-The Stripe CLI supports a broad range of commands. Below is some of the most used ones:
+The Stripe CLI supports a broad range of commands. Below are some of the most used ones:
 - [`login`](https://stripe.com/docs/cli/login)
 - [`listen`](https://stripe.com/docs/cli/listen)
 - [`trigger`](https://stripe.com/docs/cli/trigger)

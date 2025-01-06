@@ -14,8 +14,11 @@ import (
 	"runtime"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/plugins/proto"
 	"github.com/stripe/stripe-cli/pkg/requests"
 	"github.com/stripe/stripe-cli/pkg/stripe"
 
@@ -33,11 +36,11 @@ var (
 
 // Plugin contains the plugin properties
 type Plugin struct {
-	Shortname        string
-	Shortdesc        string
-	Binary           string
+	Shortname        string    `toml:"Shortname"`
+	Shortdesc        string    `toml:"Shortdesc"`
+	Binary           string    `toml:"Binary"`
 	Releases         []Release `toml:"Release"`
-	MagicCookieValue string
+	MagicCookieValue string    `toml:"MagicCookieValue"`
 }
 
 // PluginList contains a list of plugins
@@ -47,10 +50,10 @@ type PluginList struct {
 
 // Release is the type that holds release data for a specific build of a plugin
 type Release struct {
-	Arch    string
-	OS      string
-	Version string
-	Sum     string
+	Arch    string `toml:"Arch"`
+	OS      string `toml:"OS"`
+	Version string `toml:"Version"`
+	Sum     string `toml:"Sum"`
 }
 
 // getPluginInterface computes the correct metadata needed for starting the hcplugin client
@@ -66,6 +69,9 @@ func (p *Plugin) getPluginInterface() (hcplugin.HandshakeConfig, map[int]hcplugi
 		1: {
 			"main": &CLIPluginV1{},
 		},
+		2: {
+			"main": &CLIPluginGRPC{},
+		},
 	}
 
 	return handshakeConfig, pluginSetMap
@@ -75,8 +81,9 @@ func (p *Plugin) getPluginInterface() (hcplugin.HandshakeConfig, map[int]hcplugi
 func (p *Plugin) getPluginInstallPath(config config.IConfig, version string) string {
 	pluginsDir := getPluginsDir(config)
 	pluginPath := filepath.Join(pluginsDir, p.Shortname, version)
+	cleanedPath := filepath.Clean(pluginPath)
 
-	return pluginPath
+	return cleanedPath
 }
 
 // cleanUpPluginPath empties the plugin folder except for the version specified
@@ -186,8 +193,7 @@ func (p *Plugin) Install(ctx context.Context, cfg config.IConfig, fs afero.Fs, v
 		return err
 	}
 
-	profile := cfg.GetProfile()
-	installedList := profile.GetInstalledPlugins()
+	installedList := cfg.GetInstalledPlugins()
 
 	// check for plugin already in list (ie. in the case of an upgrade)
 	isInstalled := false
@@ -217,7 +223,53 @@ func (p *Plugin) Install(ctx context.Context, cfg config.IConfig, fs afero.Fs, v
 	return nil
 }
 
+// Uninstall removes a plugin from the disk and from the config's installed plugins list
+func (p *Plugin) Uninstall(ctx context.Context, config config.IConfig, fs afero.Fs) error {
+	pluginList := config.GetInstalledPlugins()
+	pluginIdx := -1
+
+	for i, name := range pluginList {
+		if name == p.Shortname {
+			pluginIdx = i
+		}
+	}
+
+	if pluginIdx == -1 {
+		return errors.New("this plugin doesn't seem to be installed, canceling")
+	}
+
+	pluginDir := p.getPluginInstallPath(config, "")
+
+	err := fs.RemoveAll(pluginDir)
+
+	if err != nil {
+		return err
+	}
+
+	// remove plugin from installed plugins list in profile
+	installedList := make([]string, 0)
+	installedList = append(installedList, pluginList[:pluginIdx]...)
+	installedList = append(installedList, pluginList[pluginIdx+1:]...)
+	config.WriteConfigField("installed_plugins", installedList)
+
+	return nil
+}
+
 func (p *Plugin) downloadAndSavePlugin(config config.IConfig, pluginDownloadURL string, fs afero.Fs, version string) error {
+	body, err := FetchRemoteResource(pluginDownloadURL)
+	if err != nil {
+		return err
+	}
+
+	err = p.verifychecksumAndSavePlugin(body, config, fs, version)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *Plugin) verifychecksumAndSavePlugin(pluginData []byte, config config.IConfig, fs afero.Fs, version string) error {
 	logger := log.WithFields(log.Fields{
 		"prefix": "plugins.plugin.Install",
 	})
@@ -228,30 +280,21 @@ func (p *Plugin) downloadAndSavePlugin(config config.IConfig, pluginDownloadURL 
 
 	logger.Debugf("installing %s to %s...", p.Shortname, pluginFilePath)
 
-	body, err := FetchRemoteResource(pluginDownloadURL)
+	reader := bytes.NewReader(pluginData)
 
-	if err != nil {
-		return err
-	}
-
-	reader := bytes.NewReader(body)
-
-	err = p.verifyChecksum(reader, version)
-
+	err := p.verifyChecksum(reader, version)
 	if err != nil {
 		logger.Debug("could not match checksum of plugin")
 		return err
 	}
 
 	err = fs.MkdirAll(pluginDir, 0755)
-
 	if err != nil {
 		logger.Debugf("could not create plugin directory: %s", pluginDir)
 		return err
 	}
 
-	err = afero.WriteFile(fs, pluginFilePath, body, 0755)
-
+	err = afero.WriteFile(fs, pluginFilePath, pluginData, 0755)
 	if err != nil {
 		logger.Debug("could not save plugin to disk")
 		return err
@@ -335,6 +378,9 @@ func (p *Plugin) Run(ctx context.Context, config *config.Config, fs afero.Fs, ar
 		Logger:           pluginLogger,
 		Managed:          true,
 		StartTimeout:     timeout,
+		AllowedProtocols: []hcplugin.Protocol{
+			hcplugin.ProtocolGRPC, hcplugin.ProtocolNetRPC,
+		},
 	}
 
 	sum, err := p.getChecksum(version)
@@ -365,14 +411,26 @@ func (p *Plugin) Run(ctx context.Context, config *config.Config, fs afero.Fs, ar
 	}
 
 	// get the native golang interface for the plugin so that we can call it directly
-	dispatcher := raw.(Dispatcher)
-
-	// run the command that the user specified via args
-	_, err = dispatcher.RunCommand(args)
-
-	if err != nil {
-		return err
+	switch d := raw.(type) {
+	case Dispatcher:
+		logger.Debug("negotiated net/rpc with plugin process")
+		if _, err = d.RunCommand(args); err != nil {
+			return err
+		}
+	case DispatcherGRPC:
+		logger.Debug("negotiated gRPC with plugin process")
+		additionalInfo := &proto.AdditionalInfo{
+			IsTerminal: &proto.IsTerminal{
+				Stdin:  term.IsTerminal(int(os.Stdin.Fd())),
+				Stdout: term.IsTerminal(int(os.Stdout.Fd())),
+				Stderr: term.IsTerminal(int(os.Stderr.Fd())),
+			},
+		}
+		if err = d.RunCommand(additionalInfo, args); err != nil {
+			return err
+		}
+	default:
+		return errors.New("dispensed an unknown plugin interface")
 	}
-
 	return nil
 }

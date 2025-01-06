@@ -4,19 +4,36 @@
   },
   "fixtures": [
     {
+      "name": "product",
+      "path": "/v1/products",
+      "method": "post",
+      "params": {
+          "name": "myproduct",
+          "description": "(created by Stripe CLI)"
+      }
+    },
+    {
+      "name": "price",
+      "path": "/v1/prices",
+      "method": "post",
+      "params": {
+        "product": "${product:id}",
+        "unit_amount": "1500",
+        "currency": "eur"
+      }
+    },
+    {
       "name": "checkout_session",
       "path": "/v1/checkout/sessions",
       "method": "post",
       "params": {
         "success_url": "https://httpbin.org/post",
         "cancel_url": "https://httpbin.org/post",
-        "payment_method_types": ["bacs_debit"],
+        "payment_method_types": ["sepa_debit"],
+        "mode": "payment",
         "line_items": [
           {
-            "name": "t-shirt",
-            "description": "comfortable cotton t-shirt",
-            "amount": 1500,
-            "currency": "gbp",
+            "price": "${price:id}",
             "quantity": 2
           }
         ],
@@ -45,10 +62,9 @@
       "path": "/v1/payment_methods",
       "method": "post",
       "params": {
-        "type": "bacs_debit",
-        "bacs_debit": {
-          "account_number": "00012345",
-          "sort_code": "108800"
+        "type": "sepa_debit",
+        "sepa_debit": {
+          "iban": "AT611904300234573201"
         },
         "billing_details": {
           "email": "stripe@example.com",

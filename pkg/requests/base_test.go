@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/stripe/stripe-cli/pkg/config"
 )
 
 func TestBuildDataForRequest(t *testing.T) {
@@ -19,7 +21,7 @@ func TestBuildDataForRequest(t *testing.T) {
 	params := &RequestParameters{data: []string{"bender=robot", "fry=human"}}
 	expected := "bender=robot&fry=human"
 
-	output, _ := rb.buildDataForRequest(params)
+	output, _ := rb.BuildDataForRequest(params)
 	require.Equal(t, expected, output)
 }
 
@@ -28,7 +30,7 @@ func TestBuildDataForRequestParamOrdering(t *testing.T) {
 	params := &RequestParameters{data: []string{"fry=human", "bender=robot"}}
 	expected := "fry=human&bender=robot"
 
-	output, _ := rb.buildDataForRequest(params)
+	output, _ := rb.BuildDataForRequest(params)
 	require.Equal(t, expected, output)
 }
 
@@ -37,7 +39,7 @@ func TestBuildDataForRequestExpand(t *testing.T) {
 	params := &RequestParameters{expand: []string{"futurama.employees", "futurama.ships"}}
 	expected := "expand[]=futurama.employees&expand[]=futurama.ships"
 
-	output, _ := rb.buildDataForRequest(params)
+	output, _ := rb.BuildDataForRequest(params)
 	require.Equal(t, expected, output)
 }
 
@@ -53,7 +55,7 @@ func TestBuildDataForRequestPagination(t *testing.T) {
 
 	expected := "limit=10&starting_after=bender&ending_before=leela"
 
-	output, _ := rb.buildDataForRequest(params)
+	output, _ := rb.BuildDataForRequest(params)
 	require.Equal(t, expected, output)
 }
 
@@ -69,7 +71,7 @@ func TestBuildDataForRequestGetOnly(t *testing.T) {
 
 	expected := ""
 
-	output, _ := rb.buildDataForRequest(params)
+	output, _ := rb.BuildDataForRequest(params)
 	require.Equal(t, expected, output)
 }
 
@@ -78,7 +80,7 @@ func TestBuildDataForRequestInvalidArgument(t *testing.T) {
 	params := &RequestParameters{data: []string{"bender=robot", "fry"}}
 	expected := "Invalid data argument: fry"
 
-	data, err := rb.buildDataForRequest(params)
+	data, err := rb.BuildDataForRequest(params)
 	require.Equal(t, "", data)
 	require.Equal(t, expected, err.Error())
 }
@@ -88,7 +90,7 @@ func TestMakeRequest(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK!"))
 
-		reqBody, err := ioutil.ReadAll(r.Body)
+		reqBody, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 
 		require.Equal(t, http.MethodGet, r.Method)
@@ -109,7 +111,7 @@ func TestMakeRequest(t *testing.T) {
 		expand: []string{"futurama.employees", "futurama.ships"},
 	}
 
-	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, true)
+	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, true, nil)
 	require.NoError(t, err)
 }
 
@@ -125,7 +127,7 @@ func TestMakeRequest_ErrOnStatus(t *testing.T) {
 
 	params := &RequestParameters{}
 
-	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, true)
+	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, true, nil)
 	require.Error(t, err)
 	require.Equal(t, "Request failed, status=500, body=:(", err.Error())
 }
@@ -151,7 +153,7 @@ func TestMakeRequest_ErrOnAPIKeyExpired(t *testing.T) {
 
 	params := &RequestParameters{}
 
-	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, false)
+	_, err := rb.MakeRequest(context.Background(), "sk_test_1234", "/foo/bar", params, false, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Request failed, status=401, body=")
 }
@@ -161,7 +163,7 @@ func TestMakeMultiPartRequest(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("FILES!"))
 
-		reqBody, err := ioutil.ReadAll(r.Body)
+		reqBody, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 
 		require.Equal(t, http.MethodPost, r.Method)
@@ -296,4 +298,30 @@ func TestIsAPIKeyExpiredError(t *testing.T) {
 	t.Run("non-RequestError", func(t *testing.T) {
 		require.False(t, IsAPIKeyExpiredError(fmt.Errorf("other")))
 	})
+}
+
+func TestRequestSigning(t *testing.T) {
+	rb := Base{}
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	err := rb.experimentalRequestSigning(req, config.ExperimentalFields{
+		StripeHeaders:  "Stripe-Context=test-context;Authorization=TEST-PREFIX 123",
+		ContextualName: "test-name",
+		PrivateKey:     "test-key",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "test-context", req.Header.Get("Stripe-Context"))
+	require.Equal(t, "TEST-PREFIX 123", req.Header.Get("Authorization"))
+}
+
+func TestRequestSigningShouldNotBeCalled(t *testing.T) {
+	rb := Base{}
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	err := rb.experimentalRequestSigning(req, config.ExperimentalFields{
+		StripeHeaders:  "",
+		ContextualName: "",
+		PrivateKey:     "",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "", req.Header.Get("Stripe-Context"))
+	require.Equal(t, "", req.Header.Get("Authorization"))
 }

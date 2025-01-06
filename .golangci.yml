@@ -10,7 +10,6 @@ linters:
     - dogsled
     - dupl
     - exportloopref
-    - goconst
     - gocritic
     - gocyclo
     - gofmt
@@ -22,9 +21,9 @@ linters:
     - misspell
     - nakedret
     - revive
-    - rowserrcheck
+    # - rowserrcheck -- disabled because of https://github.com/golangci/golangci-lint/issues/2649
     - staticcheck
-    - structcheck
+    # - structcheck -- disabled because of https://github.com/golangci/golangci-lint/issues/2649
     - typecheck
     - unconvert
     - unused

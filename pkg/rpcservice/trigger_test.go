@@ -14,18 +14,20 @@ import (
 	"github.com/stripe/stripe-cli/rpc"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const customerPath = "/v1/customers"
 const customerWithIDPath = "/v1/customers/cust_12345"
 const customerPayload = `{"id": "cust_12345", "foo": "bar"}`
-const planPath = "/v1/plans"
+const productPath = "/v1/products"
+const pricePath = "/v1/prices"
 const subscriptionPath = "/v1/subscriptions"
 
 func TestTriggerSucceedsWithSupportedEvent(t *testing.T) {
 	ctx := withAuth(context.Background())
 
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -62,7 +64,7 @@ func TestTriggerSucceedsWithSupportedEvent(t *testing.T) {
 func TestTriggerSucceedsWithStripeAccount(t *testing.T) {
 	ctx := withAuth(context.Background())
 
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -100,7 +102,7 @@ func TestTriggerSucceedsWithStripeAccount(t *testing.T) {
 func TestTriggerFailsWithUnsupportedEvent(t *testing.T) {
 	ctx := withAuth(context.Background())
 
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestTriggerFailsWithUnsupportedEvent(t *testing.T) {
 func TestTriggerFailsWithEmptyEvent(t *testing.T) {
 	ctx := withAuth(context.Background())
 
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -138,7 +140,7 @@ func TestTriggerFailsWithEmptyEvent(t *testing.T) {
 func TestTriggerSucceedsWithFixtureFlags(t *testing.T) {
 	ctx := withAuth(context.Background())
 
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -151,8 +153,10 @@ func TestTriggerSucceedsWithFixtureFlags(t *testing.T) {
 		case customerPath:
 			require.True(t, strings.Contains(string(body), "name=testUser"))
 			require.True(t, strings.Contains(string(body), "email=testEmail"))
-		case planPath:
-			require.True(t, strings.Contains(string(body), "amount=500"))
+		case productPath:
+			require.True(t, strings.Contains(string(body), "name=myproduct"))
+		case pricePath:
+			require.True(t, strings.Contains(string(body), "unit_amount=500"))
 		case subscriptionPath:
 			require.False(t, strings.Contains(string(body), "description"))
 		default:
@@ -168,13 +172,13 @@ func TestTriggerSucceedsWithFixtureFlags(t *testing.T) {
 		Event:         "customer.subscription.created",
 		StripeAccount: "acct_123",
 		Skip:          []string{},
-		Override:      []string{"customer:name=testUser", "plan:amount=500"},
+		Override:      []string{"customer:name=testUser", "price:unit_amount=500"},
 		Add:           []string{"customer:email=testEmail"},
 		Remove:        []string{"customer:description"},
 	})
 
 	expected := rpc.TriggerResponse{
-		Requests: []string{"customer", "plan", "subscription"},
+		Requests: []string{"customer", "product", "price", "subscription"},
 	}
 
 	assert.Nil(t, err)

@@ -64,7 +64,13 @@ func (cc *CreateCmd) runCreateCmd(cmd *cobra.Command, args []string) error {
 	color := ansi.Color(os.Stdout)
 	spinner := ansi.StartNewSpinner(fmt.Sprintf("Downloading %s", selectedSample), os.Stdout)
 
-	sampleConfig, err := samples.GetSampleConfig(selectedSample, cc.forceRefresh)
+	sampleManager, err := samples.NewSampleManager(cc.cfg)
+	if err != nil {
+		ansi.StopSpinner(spinner, "", os.Stdout)
+		return err
+	}
+
+	sampleConfig, err := sampleManager.GetSampleConfig(selectedSample, cc.forceRefresh)
 	if err != nil {
 		ansi.StopSpinner(spinner, "", os.Stdout)
 		return err
@@ -83,9 +89,8 @@ func (cc *CreateCmd) runCreateCmd(cmd *cobra.Command, args []string) error {
 
 	resultChan := make(chan samples.CreationResult)
 
-	go samples.Create(
+	go sampleManager.Create(
 		cmd.Context(),
-		cc.cfg,
 		selectedSample,
 		selectedConfig,
 		destination,
@@ -112,6 +117,9 @@ func (cc *CreateCmd) runCreateCmd(cmd *cobra.Command, args []string) error {
 		case samples.DidConfigure:
 			ansi.StopSpinner(spinner, "", os.Stdout)
 			fmt.Printf("%s %s\n", color.Green("✔"), ansi.Faint("Project configured"))
+		case samples.DidConfigureWithoutTestPubKey:
+			ansi.StopSpinner(spinner, "", os.Stdout)
+			fmt.Printf("%s %s\n", color.Green("⚠️"), ansi.Faint("Project configured without testmode publishable key. Please update your pk_test... key in the .env file in the server folder"))
 		case samples.Done:
 			fmt.Println("You're all set. To get started: cd", destination)
 			if res.PostInstall != "" {
@@ -173,6 +181,7 @@ func selectOptions(template, label string, options []string) (string, error) {
 		Label:     label,
 		Items:     options,
 		Templates: templates,
+		Size:      7,
 	}
 
 	_, result, err := prompt.Run()

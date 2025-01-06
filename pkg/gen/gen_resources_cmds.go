@@ -15,6 +15,7 @@ import (
 	"github.com/iancoleman/strcase"
 
 	"github.com/stripe/stripe-cli/pkg/cmd/resource"
+	"github.com/stripe/stripe-cli/pkg/gen"
 	"github.com/stripe/stripe-cli/pkg/spec"
 )
 
@@ -27,7 +28,8 @@ type NamespaceData struct {
 }
 
 type ResourceData struct {
-	Operations map[string]*OperationData
+	Operations   map[string]*OperationData
+	SubResources map[string]*ResourceData
 }
 
 type OperationData struct {
@@ -46,12 +48,7 @@ const (
 	pathOutput = "resources_cmds.go"
 )
 
-var scalarTypes = map[string]bool{
-	"boolean": true,
-	"integer": true,
-	"number":  true,
-	"string":  true,
-}
+var test_helpers_path = "test_helpers"
 
 func main() {
 	// This is the script that generates the `resources.go` file from the
@@ -114,84 +111,182 @@ func getTemplateData() (*TemplateData, error) {
 			continue
 		}
 
-		nsName, resName := parseSchemaName(name)
+		err := genCmdTemplate(name, name, data, stripeAPI)
+		if err != nil {
+			return nil, err
+		}
 
-		// Iterate over every operation for the resource
-		for _, op := range *schema.XStripeOperations {
-			// We're only implementing "service" operations
-			if op.MethodOn != "service" {
-				continue
-			}
+		alias := resource.GetCmdAlias(name)
 
-			// If we haven't seen the namespace before, initialize it
-			if _, ok := data.Namespaces[nsName]; !ok {
-				data.Namespaces[nsName] = &NamespaceData{
-					Resources: make(map[string]*ResourceData),
-				}
-			}
-
-			// If we haven't seen the resource before, initialize it
-			resCmdName := resource.GetResourceCmdName(resName)
-			if _, ok := data.Namespaces[nsName].Resources[resCmdName]; !ok {
-				data.Namespaces[nsName].Resources[resCmdName] = &ResourceData{
-					Operations: make(map[string]*OperationData),
-				}
-			}
-
-			// If we haven't seen the operation before, initialize it
-			if _, ok := data.Namespaces[nsName].Resources[resCmdName].Operations[op.MethodName]; !ok {
-				httpString := string(op.Operation)
-				properties := make(map[string]string)
-
-				specOp := stripeAPI.Paths[spec.Path(op.Path)][spec.HTTPVerb(httpString)]
-
-				// Skip deprecated methods
-				if specOp.Deprecated != nil && *specOp.Deprecated == true {
-					continue
-				}
-
-				if strings.ToUpper(httpString) == http.MethodPost {
-					requestContent := specOp.RequestBody.Content
-
-					if media, ok := requestContent["application/x-www-form-urlencoded"]; ok {
-						for propName, schema := range media.Schema.Properties {
-							scalarType := getScalarType(schema)
-
-							if scalarType == nil {
-								continue
-							}
-
-							properties[propName] = *scalarType
-						}
-					}
-				} else {
-					for _, param := range specOp.Parameters {
-						// Only create flags for query string parameters
-						if param.In != "query" {
-							continue
-						}
-
-						schema := param.Schema
-						scalarType := getScalarType(schema)
-
-						if scalarType == nil {
-							continue
-						}
-
-						properties[param.Name] = *scalarType
-					}
-				}
-
-				data.Namespaces[nsName].Resources[resCmdName].Operations[op.MethodName] = &OperationData{
-					Path:      op.Path,
-					HTTPVerb:  httpString,
-					PropFlags: properties,
-				}
+		if alias != "" {
+			// Aliased commands write a second entry into the resource commands, and use post-processing to hide the
+			// command from the index (e.g. when running `stripe resources`)
+			err := genCmdTemplate(name, alias, data, stripeAPI)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	return data, nil
+}
+
+func genCmdTemplate(schemaName string, cmdName string, data *TemplateData, stripeAPI *spec.Spec) error {
+	origNsName, origResName := parseSchemaName(cmdName)
+	schema := stripeAPI.Components.Schemas[schemaName]
+
+	// Iterate over every operation for the resource
+	for _, op := range *schema.XStripeOperations {
+		// We're only implementing "service" operations
+		if op.MethodOn != "service" {
+			continue
+		}
+
+		nsName := origNsName
+		resName := origResName
+		subResName := ""
+
+		if strings.Contains(op.Path, test_helpers_path) && test_helpers_path != nsName {
+			// create entry in the test_helpers namespace
+			if nsName != "" {
+				err := addToTemplateData(data, test_helpers_path, nsName, resName, stripeAPI, op)
+				if err != nil {
+					return err
+				}
+			} else {
+				err := addToTemplateData(data, test_helpers_path, resName, "", stripeAPI, op)
+				if err != nil {
+					return err
+				}
+			}
+
+			// add test_helpers as a sub-resource to the current namespace-resource entry
+			subResName = test_helpers_path
+		}
+
+		err := addToTemplateData(data, nsName, resName, subResName, stripeAPI, op)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func addToTemplateData(data *TemplateData, nsName, resName, subResName string, stripeAPI *spec.Spec, op spec.StripeOperation) error {
+	hasSubResources := subResName != ""
+
+	if _, ok := data.Namespaces[nsName]; !ok {
+		data.Namespaces[nsName] = &NamespaceData{
+			Resources: make(map[string]*ResourceData),
+		}
+	}
+
+	// If we haven't seen the resource before, initialize it
+	resCmdName := resource.GetResourceCmdName(resName)
+	if _, ok := data.Namespaces[nsName].Resources[resCmdName]; !ok {
+		data.Namespaces[nsName].Resources[resCmdName] = &ResourceData{
+
+			Operations:   make(map[string]*OperationData),
+			SubResources: make(map[string]*ResourceData),
+		}
+	}
+
+	// check if operations already exists
+	operationExists := true
+	subResCmdName := ""
+
+	if hasSubResources {
+		// If we haven't seen the sub-resource before, initialize it
+		subResCmdName = resource.GetResourceCmdName(subResName)
+		if _, ok := data.Namespaces[nsName].Resources[resCmdName].SubResources[subResCmdName]; !ok {
+			data.Namespaces[nsName].Resources[resCmdName].SubResources[subResCmdName] = &ResourceData{
+				Operations: make(map[string]*OperationData),
+			}
+		}
+		_, operationExists = data.Namespaces[nsName].Resources[resCmdName].SubResources[subResCmdName].Operations[op.MethodName]
+	} else {
+		_, operationExists = data.Namespaces[nsName].Resources[resCmdName].Operations[op.MethodName]
+	}
+
+	// If we haven't seen the operation before, initialize it
+	if !operationExists {
+		httpString := string(op.Operation)
+		properties := make(map[string]string)
+
+		specOp := stripeAPI.Paths[spec.Path(op.Path)][spec.HTTPVerb(httpString)]
+
+		// Skip deprecated methods
+		if specOp.Deprecated != nil && *specOp.Deprecated == true {
+			return nil
+		}
+
+		if strings.ToUpper(httpString) == http.MethodPost {
+			requestContent := specOp.RequestBody.Content
+
+			if media, ok := requestContent["application/x-www-form-urlencoded"]; ok {
+				for propName, schema := range media.Schema.Properties {
+					// If property is metadata or expand, skip it
+					if propName == "metadata" || propName == "expand" {
+						continue
+					}
+
+					if schema.Type == "object" {
+						denormalizedProps := gen.DenormalizeObject(propName, schema)
+						for prop, propType := range denormalizedProps {
+							properties[prop] = propType
+						}
+
+					} else {
+						scalarType := gen.GetType(schema)
+
+						if scalarType == nil {
+							continue
+						}
+
+						properties[propName] = *scalarType
+					}
+				}
+			}
+		} else {
+			for _, param := range specOp.Parameters {
+				// Only create flags for query string parameters
+				if param.In != "query" {
+					continue
+				}
+
+				// Skip metadata and expand params
+				if param.Name == "metadata" || param.Name == "expand" {
+					continue
+				}
+
+				schema := param.Schema
+				scalarType := gen.GetType(schema)
+
+				if scalarType == nil {
+					continue
+				}
+
+				properties[param.Name] = *scalarType
+			}
+		}
+
+		if hasSubResources {
+			data.Namespaces[nsName].Resources[resCmdName].SubResources[subResCmdName].Operations[op.MethodName] = &OperationData{
+				Path:      op.Path,
+				HTTPVerb:  httpString,
+				PropFlags: properties,
+			}
+		} else {
+			data.Namespaces[nsName].Resources[resCmdName].Operations[op.MethodName] = &OperationData{
+				Path:      op.Path,
+				HTTPVerb:  httpString,
+				PropFlags: properties,
+			}
+		}
+	}
+
+	return nil
 }
 
 func parseSchemaName(name string) (string, string) {
@@ -200,33 +295,4 @@ func parseSchemaName(name string) (string, string) {
 		return components[0], components[1]
 	}
 	return "", name
-}
-
-// getScalarType accepts a schema and returns its scalar type, if it has one.
-//
-// If the schema is monomorphic, it returns its type if it's scalar.
-//
-// If the schema is polymorphic, it returns the first scalar type for the
-// schema, if there is any.
-func getScalarType(schema *spec.Schema) *string {
-	if len(schema.AnyOf) > 0 {
-		for _, subSchema := range schema.AnyOf {
-			scalarType := getScalarType(subSchema)
-			if scalarType != nil {
-				return scalarType
-			}
-		}
-	} else if scalarTypes[schema.Type] {
-		// Special case for string types that only support the "" (empty
-		// string) value: we consider these to be non-scalar so we don't
-		// generate a flag for those.
-		if schema.Type == "string" {
-			if len(schema.Enum) == 1 && schema.Enum[0] == "" {
-				return nil
-			}
-		}
-		return &schema.Type
-	}
-
-	return nil
 }

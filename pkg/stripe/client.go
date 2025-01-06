@@ -15,15 +15,6 @@ import (
 	"github.com/stripe/stripe-cli/pkg/useragent"
 )
 
-// DefaultAPIBaseURL is the default base URL for API requests
-const DefaultAPIBaseURL = "https://api.stripe.com"
-
-// DefaultFilesAPIBaseURL is the default base URL for Files API requsts
-const DefaultFilesAPIBaseURL = "https://files.stripe.com"
-
-// DefaultDashboardBaseURL is the default base URL for dashboard requests
-const DefaultDashboardBaseURL = "https://dashboard.stripe.com"
-
 // APIVersion is API version used in CLI
 const APIVersion = "2019-03-14"
 
@@ -50,8 +41,14 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// RequestPerformer is an interface for executing requests against the Stripe
+// API, usually satisfied by providing a stripe.Client.
+type RequestPerformer interface {
+	PerformRequest(ctx context.Context, method, path string, params string, configure func(*http.Request) error) (*http.Response, error)
+}
+
 // PerformRequest sends a request to Stripe and returns the response.
-func (c *Client) PerformRequest(ctx context.Context, method, path string, params string, configure func(*http.Request)) (*http.Response, error) {
+func (c *Client) PerformRequest(ctx context.Context, method, path string, params string, configure func(*http.Request) error) (*http.Response, error) {
 	url, err := url.Parse(path)
 	if err != nil {
 		return nil, err
@@ -81,7 +78,9 @@ func (c *Client) PerformRequest(ctx context.Context, method, path string, params
 	}
 
 	if configure != nil {
-		configure(req)
+		if err := configure(req); err != nil {
+			return nil, err
+		}
 	}
 
 	if c.httpClient == nil {

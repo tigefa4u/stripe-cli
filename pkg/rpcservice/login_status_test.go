@@ -10,9 +10,12 @@ import (
 
 	"github.com/stripe/stripe-cli/pkg/config"
 	"github.com/stripe/stripe-cli/pkg/login"
+	"github.com/stripe/stripe-cli/pkg/login/acct"
+	"github.com/stripe/stripe-cli/pkg/login/keys"
 	"github.com/stripe/stripe-cli/rpc"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestLoginStatusSucceeds(t *testing.T) {
@@ -22,23 +25,23 @@ func TestLoginStatusSucceeds(t *testing.T) {
 		VerificationCode: "baz",
 	}
 
-	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*login.PollAPIKeyResponse, *login.Account, error) {
-		return &login.PollAPIKeyResponse{}, &login.Account{
+	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*keys.PollAPIKeyResponse, *acct.Account, error) {
+		return &keys.PollAPIKeyResponse{}, &acct.Account{
 			ID: "acct_12345",
-			Settings: login.Settings{
-				Dashboard: login.Dashboard{
+			Settings: acct.Settings{
+				Dashboard: acct.Dashboard{
 					DisplayName: "my display name",
 				},
 			},
 		}, nil
 	}
 
-	configureProfile = func(config *config.Config, response *login.PollAPIKeyResponse) error {
+	configureProfile = func(config *config.Config, response *keys.PollAPIKeyResponse) error {
 		return nil
 	}
 
 	ctx := withAuth(context.Background())
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -60,23 +63,23 @@ func TestLoginStatusSucceeds(t *testing.T) {
 func TestLoginStatusFailsWhenLinksEmpty(t *testing.T) {
 	links = &login.Links{}
 
-	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*login.PollAPIKeyResponse, *login.Account, error) {
-		return &login.PollAPIKeyResponse{}, &login.Account{
+	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*keys.PollAPIKeyResponse, *acct.Account, error) {
+		return &keys.PollAPIKeyResponse{}, &acct.Account{
 			ID: "acct_12345",
-			Settings: login.Settings{
-				Dashboard: login.Dashboard{
+			Settings: acct.Settings{
+				Dashboard: acct.Dashboard{
 					DisplayName: "my display name",
 				},
 			},
 		}, nil
 	}
 
-	configureProfile = func(config *config.Config, response *login.PollAPIKeyResponse) error {
+	configureProfile = func(config *config.Config, response *keys.PollAPIKeyResponse) error {
 		return nil
 	}
 
 	ctx := withAuth(context.Background())
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -92,23 +95,23 @@ func TestLoginStatusFailsWhenLinksEmpty(t *testing.T) {
 func TestLoginStatusFailsWhenLinksNil(t *testing.T) {
 	links = nil
 
-	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*login.PollAPIKeyResponse, *login.Account, error) {
-		return &login.PollAPIKeyResponse{}, &login.Account{
+	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*keys.PollAPIKeyResponse, *acct.Account, error) {
+		return &keys.PollAPIKeyResponse{}, &acct.Account{
 			ID: "acct_12345",
-			Settings: login.Settings{
-				Dashboard: login.Dashboard{
+			Settings: acct.Settings{
+				Dashboard: acct.Dashboard{
 					DisplayName: "my display name",
 				},
 			},
 		}, nil
 	}
 
-	configureProfile = func(config *config.Config, response *login.PollAPIKeyResponse) error {
+	configureProfile = func(config *config.Config, response *keys.PollAPIKeyResponse) error {
 		return nil
 	}
 
 	ctx := withAuth(context.Background())
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -124,16 +127,16 @@ func TestLoginStatusFailsWhenLinksNil(t *testing.T) {
 func TestLoginStatusFailsWhenPollFails(t *testing.T) {
 	links = nil
 
-	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*login.PollAPIKeyResponse, *login.Account, error) {
+	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*keys.PollAPIKeyResponse, *acct.Account, error) {
 		return nil, nil, errors.New("pollForKey failed")
 	}
 
-	configureProfile = func(config *config.Config, response *login.PollAPIKeyResponse) error {
+	configureProfile = func(config *config.Config, response *keys.PollAPIKeyResponse) error {
 		return nil
 	}
 
 	ctx := withAuth(context.Background())
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
@@ -149,23 +152,23 @@ func TestLoginStatusFailsWhenPollFails(t *testing.T) {
 func TestLoginStatusFailsWhenConfigureProfileFails(t *testing.T) {
 	links = nil
 
-	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*login.PollAPIKeyResponse, *login.Account, error) {
-		return &login.PollAPIKeyResponse{}, &login.Account{
+	pollForKey = func(ctx context.Context, pollURL string, interval time.Duration, maxAttempts int) (*keys.PollAPIKeyResponse, *acct.Account, error) {
+		return &keys.PollAPIKeyResponse{}, &acct.Account{
 			ID: "acct_12345",
-			Settings: login.Settings{
-				Dashboard: login.Dashboard{
+			Settings: acct.Settings{
+				Dashboard: acct.Dashboard{
 					DisplayName: "my display name",
 				},
 			},
 		}, nil
 	}
 
-	configureProfile = func(config *config.Config, response *login.PollAPIKeyResponse) error {
+	configureProfile = func(config *config.Config, response *keys.PollAPIKeyResponse) error {
 		return errors.New("configureProfile failed")
 	}
 
 	ctx := withAuth(context.Background())
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}

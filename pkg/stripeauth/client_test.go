@@ -3,13 +3,15 @@ package stripeauth
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/stripe/stripe-cli/pkg/stripe"
 )
 
 func TestAuthorize(t *testing.T) {
@@ -30,16 +32,19 @@ func TestAuthorize(t *testing.T) {
 		require.NotEmpty(t, r.UserAgent())
 		require.NotEmpty(t, r.Header.Get("X-Stripe-Client-User-Agent"))
 
-		body, err := ioutil.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.Equal(t, "device_name=my-device&websocket_feature=webhooks", string(body))
+		require.Equal(t, "my-device", r.FormValue("device_name"))
+		require.Equal(t, "webhooks", r.FormValue("websocket_features[]"))
 	}))
 	defer ts.Close()
 
-	client := NewClient("sk_test_123", &Config{
-		APIBaseURL: ts.URL,
+	baseURL, _ := url.Parse(ts.URL)
+	client := NewClient(&stripe.Client{APIKey: "sk_test_123", BaseURL: baseURL}, nil)
+
+	session, err := client.Authorize(context.Background(), CreateSessionRequest{
+		DeviceName:        "my-device",
+		WebSocketFeatures: []string{"webhooks"},
 	})
-	session, err := client.Authorize(context.Background(), "my-device", "webhooks", nil, nil)
+	require.NoError(t, err)
 	require.NoError(t, err)
 	require.Equal(t, "some-id", session.WebSocketID)
 	require.Equal(t, "wss://example.com/subscribe/acct_123", session.WebSocketURL)
@@ -50,22 +55,23 @@ func TestAuthorize(t *testing.T) {
 
 func TestUserAgent(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-
 		require.Regexp(t, regexp.MustCompile(`^Stripe/v1 stripe-cli/\w+$`), r.Header.Get("User-Agent"))
+		w.Write([]byte(`{}`))
 	}))
 	defer ts.Close()
 
-	client := NewClient("sk_test_123", &Config{
-		APIBaseURL: ts.URL,
+	baseURL, _ := url.Parse(ts.URL)
+	client := NewClient(&stripe.Client{APIKey: "sk_test_123", BaseURL: baseURL}, nil)
+
+	_, err := client.Authorize(context.Background(), CreateSessionRequest{
+		DeviceName:        "my-device",
+		WebSocketFeatures: []string{"webhooks"},
 	})
-	client.Authorize(context.Background(), "my-device", "webhooks", nil, nil)
+	require.NoError(t, err)
 }
 
 func TestStripeClientUserAgent(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-
 		encodedUserAgent := r.Header.Get("X-Stripe-Client-User-Agent")
 		require.NotEmpty(t, encodedUserAgent)
 
@@ -76,34 +82,48 @@ func TestStripeClientUserAgent(t *testing.T) {
 		// Just test a few headers that we know to be stable.
 		require.Equal(t, "stripe-cli", userAgent["name"])
 		require.Equal(t, "stripe", userAgent["publisher"])
+
+		w.Write([]byte(`{}`))
 	}))
 	defer ts.Close()
 
-	client := NewClient("sk_test_123", &Config{
-		APIBaseURL: ts.URL,
+	baseURL, _ := url.Parse(ts.URL)
+	client := NewClient(&stripe.Client{APIKey: "sk_test_123", BaseURL: baseURL}, nil)
+
+	_, err := client.Authorize(context.Background(), CreateSessionRequest{
+		DeviceName:        "my-device",
+		WebSocketFeatures: []string{"webhooks"},
 	})
-	client.Authorize(context.Background(), "my-device", "webhooks", nil, nil)
+	require.NoError(t, err)
 }
 
 func TestAuthorizeWithURLDeviceMap(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-
 		require.Equal(t, "my-device", r.FormValue("device_name"))
-		require.Equal(t, "webhooks", r.FormValue("websocket_feature"))
+		require.Equal(t, "webhooks", r.FormValue("websocket_features[]"))
 		require.Equal(t, "http://localhost:3000/events", r.FormValue("forward_to_url"))
 		require.Equal(t, "http://localhost:3000/connect/events", r.FormValue("forward_connect_to_url"))
+		require.Equal(t, "http://localhost:3000/thin/events", r.FormValue("forward_thin_to_url"))
+		require.Equal(t, "http://localhost:3000/thin/connect/events", r.FormValue("forward_thin_connect_to_url"))
+
+		w.Write([]byte(`{}`))
 	}))
 	defer ts.Close()
 
-	client := NewClient("sk_test_123", &Config{
-		APIBaseURL: ts.URL,
-	})
+	baseURL, _ := url.Parse(ts.URL)
+	client := NewClient(&stripe.Client{APIKey: "sk_test_123", BaseURL: baseURL}, nil)
 
 	devURLMap := DeviceURLMap{
-		ForwardURL:        "http://localhost:3000/events",
-		ForwardConnectURL: "http://localhost:3000/connect/events",
+		ForwardURL:            "http://localhost:3000/events",
+		ForwardConnectURL:     "http://localhost:3000/connect/events",
+		ForwardThinURL:        "http://localhost:3000/thin/events",
+		ForwardThinConnectURL: "http://localhost:3000/thin/connect/events",
 	}
 
-	client.Authorize(context.Background(), "my-device", "webhooks", nil, &devURLMap)
+	_, err := client.Authorize(context.Background(), CreateSessionRequest{
+		DeviceName:        "my-device",
+		WebSocketFeatures: []string{"webhooks"},
+		DeviceURLMap:      &devURLMap,
+	})
+	require.NoError(t, err)
 }
